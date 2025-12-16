@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project name="maven-antrun-" default="main">
+  <target name="main">
+    <mkdir dir="D:\cursor_project\java_project\InceptorStatCollector/bin" />
+    <copy file="D:\cursor_project\java_project\InceptorStatCollector/bin/start.sh" tofile="D:\cursor_project\java_project\InceptorStatCollector/bin/start.sh" failonerror="false" overwrite="true" />
+    <copy file="D:\cursor_project\java_project\InceptorStatCollector/bin/start.bat" tofile="D:\cursor_project\java_project\InceptorStatCollector/bin/start.bat" failonerror="false" overwrite="true" />
+  </target>
+</project>
