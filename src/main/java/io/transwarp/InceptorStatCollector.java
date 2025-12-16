@@ -45,6 +45,12 @@ public class InceptorStatCollector {
     private static final int PAGE_SIZE = ConfigUtil.getInt("page.size"); // 分页大小
     private static final String TARGET_TABLE_NAME = ConfigUtil.getString("inceptor.target.table.name"); // 目标表名
     private static final String POISON_PILL = "--TERMINATE--"; // 终止信号标记
+    // 统计级别：partition（分区级别，默认）或 table（表级别）
+    private static final String ANALYZE_LEVEL = ConfigUtil.getString("analyze.level", "partition").toLowerCase();
+    // 超时配置：分析任务完成超时时间（小时）
+    private static final int ANALYSIS_TASK_TIMEOUT_HOURS = ConfigUtil.getInt("analysis.task.timeout.hours", 2);
+    // 超时配置：批量写入线程完成超时时间（分钟）
+    private static final int BATCH_WRITER_TIMEOUT_MINUTES = ConfigUtil.getInt("batch.writer.timeout.minutes", 30);
 
     // 用于解析ANALYZE结果的正则表达式模式
     private static final Pattern RESULT_PATTERN = Pattern.compile(
@@ -54,28 +60,34 @@ public class InceptorStatCollector {
     // 时间格式化器
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd");
-    // 目标表的DDL定义（包含分区和存储格式）
-    private static final String CREATE_TABLE_DDL =
-            "CREATE TABLE IF NOT EXISTS " + TARGET_TABLE_NAME + " (\n" +
-                    "    id STRING COMMENT '唯一标识',\n" +
-                    "    data_time STRING COMMENT '插入时间',\n" +
-                    "    data_day DATE COMMENT '分区时间',\n" +
-                    "    table_name STRING COMMENT '表名',\n" +
-                    "    partition_name STRING COMMENT '分区名称',\n" +
-                    "    is_partition INT COMMENT '是否分区表',\n" +
-                    "    numFiles INT COMMENT '文件数',\n" +
-                    "    numRows INT COMMENT '行数',\n" +
-                    "    totalSize BIGINT COMMENT '总大小(字节)',\n" +
-                    "    rawDataSize BIGINT COMMENT '原始数据大小(字节)'\n" +
-                    ")\n" +
-                    "COMMENT '存放inceptor每张表的统计信息'\n" +
-                    "PARTITIONED BY RANGE (data_day)\n" +
-                    "INTERVAL (numtoyminterval('1','month'))\n" +
-                    "(\n" +
-                    "  PARTITION p VALUES LESS THAN ('1970-01-01')\n" +
-                    ")\n" +
-                    "CLUSTERED BY (id) INTO 11 BUCKETS STORED AS ORC\n" +
-                    "TBLPROPERTIES('transactional'='true')";
+    // 目标表的DDL定义（根据统计级别动态生成）
+    private static String getCreateTableDDL() {
+        StringBuilder ddl = new StringBuilder();
+        ddl.append("CREATE TABLE IF NOT EXISTS ").append(TARGET_TABLE_NAME).append(" (\n");
+        ddl.append("    id STRING COMMENT '唯一标识',\n");
+        ddl.append("    data_time STRING COMMENT '插入时间',\n");
+        ddl.append("    data_day DATE COMMENT '分区时间',\n");
+        ddl.append("    table_name STRING COMMENT '表名',\n");
+        if ("partition".equals(ANALYZE_LEVEL)) {
+            // 分区级别模式：包含 partition_name 和 is_partition 字段
+            ddl.append("    partition_name STRING COMMENT '分区名称',\n");
+            ddl.append("    is_partition INT COMMENT '是否分区表',\n");
+        }
+        ddl.append("    numFiles INT COMMENT '文件数',\n");
+        ddl.append("    numRows INT COMMENT '行数',\n");
+        ddl.append("    totalSize BIGINT COMMENT '总大小(字节)',\n");
+        ddl.append("    rawDataSize BIGINT COMMENT '原始数据大小(字节)'\n");
+        ddl.append(")\n");
+        ddl.append("COMMENT '存放inceptor每张表的统计信息'\n");
+        ddl.append("PARTITIONED BY RANGE (data_day)\n");
+        ddl.append("INTERVAL (numtoyminterval('1','month'))\n");
+        ddl.append("(\n");
+        ddl.append("  PARTITION p VALUES LESS THAN ('1970-01-01')\n");
+        ddl.append(")\n");
+        ddl.append("CLUSTERED BY (id) INTO 11 BUCKETS STORED AS ORC\n");
+        ddl.append("TBLPROPERTIES('transactional'='true')");
+        return ddl.toString();
+    }
 
     // 结果队列：用于存储解析后的表统计信息，供批量写入线程使用
     private static final BlockingQueue<String[]> resultQueue = new LinkedBlockingQueue<>(RESULT_QUEUE_CAPACITY);
@@ -90,6 +102,8 @@ public class InceptorStatCollector {
         logger.info("  - Result queue capacity: {}", RESULT_QUEUE_CAPACITY);
         logger.info("  - Page size: {}", PAGE_SIZE);
         logger.info("  - Target table: {}", TARGET_TABLE_NAME);
+        logger.info("  - Analyze level: {} ({})", ANALYZE_LEVEL, 
+                "partition".equals(ANALYZE_LEVEL) ? "partition-level statistics" : "table-level statistics");
         
         // 设置系统默认编码为UTF-8，解决中文乱码问题
         // 注意：这些设置应该在JVM启动时通过-D参数设置，这里作为备用
@@ -130,10 +144,10 @@ public class InceptorStatCollector {
              HikariDataSource writeDs = new HikariDataSource(writeConfig)) {
             logger.info("Connection pools initialized successfully");
             // 新增：执行建表操作
-            logger.info("Creating/verifying target table: {}", TARGET_TABLE_NAME);
+            logger.info("Creating/verifying target table: {} (analyze level: {})", TARGET_TABLE_NAME, ANALYZE_LEVEL);
             try (Connection conn = writeDs.getConnection();
                  Statement stmt = conn.createStatement()) {
-                stmt.execute(CREATE_TABLE_DDL);
+                stmt.execute(getCreateTableDDL());
                 logger.info("Target table created/verified successfully: {}", TARGET_TABLE_NAME);
             } catch (SQLException e) {
                 logger.error("Failed to create table: {}", TARGET_TABLE_NAME, e);
@@ -165,9 +179,9 @@ public class InceptorStatCollector {
             logger.info("All {} analyze worker threads started", CONCURRENCY);
 
             // 等待所有分析任务完成
-            logger.info("Waiting for all analysis tasks to complete (max wait: 2 hours)...");
+            logger.info("Waiting for all analysis tasks to complete (max wait: {} hours)...", ANALYSIS_TASK_TIMEOUT_HOURS);
             executor.shutdown();
-            boolean completed = executor.awaitTermination(2, TimeUnit.HOURS);
+            boolean completed = executor.awaitTermination(ANALYSIS_TASK_TIMEOUT_HOURS, TimeUnit.HOURS);
             if (completed) {
                 logger.info("All analysis tasks completed successfully");
             } else {
@@ -178,7 +192,8 @@ public class InceptorStatCollector {
             logger.info("Sending termination signal to batch writer thread...");
             resultQueue.put(new String[]{POISON_PILL});
             writerService.shutdown();
-            boolean writerCompleted = writerService.awaitTermination(30, TimeUnit.MINUTES);
+            logger.info("Waiting for batch writer thread to complete (max wait: {} minutes)...", BATCH_WRITER_TIMEOUT_MINUTES);
+            boolean writerCompleted = writerService.awaitTermination(BATCH_WRITER_TIMEOUT_MINUTES, TimeUnit.MINUTES);
             if (writerCompleted) {
                 logger.info("Batch writer thread completed successfully");
             } else {
@@ -235,15 +250,75 @@ public class InceptorStatCollector {
                          ResultSet rs = stmt.executeQuery(sql)) { // 执行ANALYZE并获取结果
                         int count = 0;
                         int parsedCount = 0;
-                        while (rs.next()) {
-                            String resultLine = rs.getString(1) + " " + rs.getString(2);
-                            Optional<String[]> parsed = parseResultLine(resultLine); // 解析结果行
-                            if (parsed.isPresent()) {
-                                resultQueue.put(parsed.get());  // 将解析结果放入结果队列
-                                parsedCount++;
+                        
+                        if ("table".equals(ANALYZE_LEVEL)) {
+                            // 表级别模式：收集所有结果并合并分区统计
+                            Map<String, long[]> tableStats = new HashMap<>(); // key: tableName, value: [numFiles, numRows, totalSize, rawDataSize]
+                            String currentTableName = null;
+                            
+                            while (rs.next()) {
+                                String resultLine = rs.getString(1) + " " + rs.getString(2);
+                                Optional<String[]> parsed = parseResultLineForMerge(resultLine);
+                                if (parsed.isPresent()) {
+                                    String tableName = parsed.get()[0];
+                                    String partition = parsed.get()[1];
+                                    
+                                    if (currentTableName == null) {
+                                        currentTableName = tableName;
+                                    }
+                                    
+                                    if (partition == null) {
+                                        // 表级别结果：直接使用
+                                        resultQueue.put(parsed.get());
+                                        parsedCount++;
+                                    } else {
+                                        // 分区级别结果：累加到表统计中
+                                        long[] stats = tableStats.getOrDefault(tableName, new long[]{0, 0, 0, 0});
+                                        stats[0] += Long.parseLong(parsed.get()[2]); // numFiles
+                                        stats[1] += Long.parseLong(parsed.get()[3]); // numRows
+                                        stats[2] += Long.parseLong(parsed.get()[4]); // totalSize
+                                        stats[3] += Long.parseLong(parsed.get()[5]); // rawDataSize
+                                        tableStats.put(tableName, stats);
+                                    }
+                                    count++;
+                                }
                             }
-                            count++;
+                            
+                            // 输出合并后的表级别统计（如果有分区数据）
+                            for (Map.Entry<String, long[]> entry : tableStats.entrySet()) {
+                                String tableName = entry.getKey();
+                                long[] stats = entry.getValue();
+                                if (stats[0] > 0 || stats[1] > 0 || stats[2] > 0 || stats[3] > 0) {
+                                    // 创建合并后的表级别结果（partition_name 为 null）
+                                    String[] mergedResult = new String[]{
+                                            tableName,
+                                            null,  // partition_name = null for table-level
+                                            String.valueOf(stats[0]),  // numFiles
+                                            String.valueOf(stats[1]),  // numRows
+                                            String.valueOf(stats[2]),  // totalSize
+                                            String.valueOf(stats[3])   // rawDataSize
+                                    };
+                                    resultQueue.put(mergedResult);
+                                    parsedCount++;
+                                    String statsInfo = String.format("numFiles:%d, numRows:%d, totalSize:%d, rawDataSize:%d",
+                                            stats[0], stats[1], stats[2], stats[3]);
+                                    logger.debug("AnalyzeWorker-{} merged partition stats for table: {}, stats: {}",
+                                            workerId, tableName + " - " + statsInfo);
+                                }
+                            }
+                        } else {
+                            // 分区级别模式：直接处理所有结果
+                            while (rs.next()) {
+                                String resultLine = rs.getString(1) + " " + rs.getString(2);
+                                Optional<String[]> parsed = parseResultLine(resultLine); // 解析结果行
+                                if (parsed.isPresent()) {
+                                    resultQueue.put(parsed.get());  // 将解析结果放入结果队列
+                                    parsedCount++;
+                                }
+                                count++;
+                            }
                         }
+                        
                         successCount++;
                         long taskElapsedTime = System.currentTimeMillis() - taskStartTime;
                         logger.debug("AnalyzeWorker-{} completed task #{}, SQL: {}, " +
@@ -271,13 +346,14 @@ public class InceptorStatCollector {
             }
         }
 
-        // 解析ANALYZE命令返回的结果行
+        // 解析ANALYZE命令返回的结果行（用于分区级别模式）
         private Optional<String[]> parseResultLine(String line) {
             Matcher m = RESULT_PATTERN.matcher(line.trim());
             if (m.matches()) {
+                String partition = m.group(3);  // partition（分区名），如果为null表示表级别
                 return Optional.of(new String[]{
                         m.group(1),   // tablePart（表名）
-                        m.group(3),   // partition（分区名）
+                        partition,    // partition（分区名），表级别时为null
                         m.group(4),   // numFiles
                         m.group(5),   // numRows
                         m.group(6),   // totalSize
@@ -288,17 +364,32 @@ public class InceptorStatCollector {
             }
             return Optional.empty();
         }
+        
+        // 解析ANALYZE命令返回的结果行（用于表级别模式，需要收集所有结果）
+        private Optional<String[]> parseResultLineForMerge(String line) {
+            return parseResultLine(line); // 使用相同的解析逻辑
+        }
     }
 
     // 结果批量写入线程：负责将统计信息批量写入目标表
     static class ResultBatchWriter implements Runnable {
         private final HikariDataSource dataSource;
-        // 插入SQL语句（注意字段顺序与目标表结构一致）
-        private static final String INSERT_SQL =
-                "INSERT INTO " + TARGET_TABLE_NAME +
+        // 插入SQL语句（根据统计级别动态生成）
+        private static String getInsertSQL() {
+            if ("partition".equals(ANALYZE_LEVEL)) {
+                // 分区级别模式：包含 partition_name 和 is_partition 字段
+                return "INSERT INTO " + TARGET_TABLE_NAME +
                         "(id, data_time, data_day, table_name, partition_name, is_partition, " +
                         "numFiles, numRows, totalSize, rawDataSize) " +
                         "VALUES (?,?,?,?,?,?,?,?,?,?)";
+            } else {
+                // 表级别模式：不包含 partition_name 和 is_partition 字段
+                return "INSERT INTO " + TARGET_TABLE_NAME +
+                        "(id, data_time, data_day, table_name, " +
+                        "numFiles, numRows, totalSize, rawDataSize) " +
+                        "VALUES (?,?,?,?,?,?,?,?)";
+            }
+        }
 
         private int totalBatches = 0;
         private int totalRecords = 0;
@@ -316,7 +407,7 @@ public class InceptorStatCollector {
             
             List<String[]> buffer = new ArrayList<>(BATCH_SIZE);  // 批量写入缓冲区
             try (Connection conn = dataSource.getConnection();
-                 PreparedStatement ps = conn.prepareStatement(INSERT_SQL)) {
+                 PreparedStatement ps = conn.prepareStatement(getInsertSQL())) {
 
                 conn.setAutoCommit(false); // 禁用自动提交，启用批量提交模式
                 logger.info("Database connection established, auto-commit disabled");
@@ -388,24 +479,29 @@ public class InceptorStatCollector {
                 String partition = row[1] != null ? row[1] : "";
                 tablesInBatch.add(tableName);
                 
-                // 判断是否为分区表
-                int isPartition = partition.isEmpty() ? 0 : 1;
-                String tablePartition = tableName;  // 始终使用表名作为id的一部分
-                String partitionName = partition.isEmpty() ? "" : partition;
                 // 生成UUID
                 String uuid = UUID.randomUUID().toString();
                 // 设置PreparedStatement参数
                 try {
-                    ps.setString(1, uuid);   // id
-                    ps.setString(2, dataTime);                       // data_time
-                    ps.setString(3, dataDay);                        // data_day
-                    ps.setString(4, tablePartition);                 // table_name
-                    ps.setString(5, partitionName);                  // partition_name ← 新增
-                    ps.setInt(6, isPartition);                       // is_partition
-                    ps.setInt(7, parseIntWithDefault(row[2]));       // numFiles
-                    ps.setInt(8, parseIntWithDefault(row[3]));       // numRows
-                    ps.setLong(9, parseLongWithDefault(row[4]));     // totalSize
-                    ps.setLong(10, parseLongWithDefault(row[5]));    // rawDataSize
+                    int paramIndex = 1;
+                    ps.setString(paramIndex++, uuid);   // id
+                    ps.setString(paramIndex++, dataTime);                       // data_time
+                    ps.setString(paramIndex++, dataDay);                        // data_day
+                    ps.setString(paramIndex++, tableName);                     // table_name
+                    
+                    if ("partition".equals(ANALYZE_LEVEL)) {
+                        // 分区级别模式：包含 partition_name 和 is_partition 字段
+                        int isPartition = (partition == null || partition.isEmpty()) ? 0 : 1;
+                        String partitionName = (partition == null || partition.isEmpty()) ? "" : partition;
+                        ps.setString(paramIndex++, partitionName);              // partition_name
+                        ps.setInt(paramIndex++, isPartition);                   // is_partition
+                    }
+                    // 表级别模式：不包含 partition_name 和 is_partition 字段
+                    
+                    ps.setInt(paramIndex++, parseIntWithDefault(row[2]));       // numFiles
+                    ps.setInt(paramIndex++, parseIntWithDefault(row[3]));       // numRows
+                    ps.setLong(paramIndex++, parseLongWithDefault(row[4]));     // totalSize
+                    ps.setLong(paramIndex++, parseLongWithDefault(row[5]));     // rawDataSize
                     ps.addBatch();   // 添加到批量操作
                     validRows++;
                 } catch (Exception e) {

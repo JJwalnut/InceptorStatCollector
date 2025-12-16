@@ -11,6 +11,7 @@
 - ✅ **异常处理**：完善的异常处理机制，单个表失败不影响整体流程
 - ✅ **连接池管理**：使用 HikariCP 连接池，分离分析和写入连接池
 - ✅ **详细日志**：提供详细的执行日志，包括启动配置、任务进度、统计信息等，所有日志均为英文，避免乱码问题
+- ✅ **灵活统计级别**：支持表级别和分区级别两种统计模式，可通过配置灵活切换，默认分区级别统计
 
 ## 收集的统计信息
 
@@ -145,12 +146,91 @@ inceptor.target.table.name=default.inceptor_stats_result_table
 
 **性能参数配置：**
 ```properties
-concurrency.level=10          # 并发工作线程数
-batch.size=500                # 批量写入大小
-result.queue.capacity=2000    # 结果队列容量
-page.size=1000                # 分页查询大小
-task.queue.capacity=100000    # 任务队列容量
+# 并发配置：并发执行 ANALYZE 的工作线程数
+# - 值越大处理越快，但数据库压力越大
+# - 建议范围：5-20，默认：10
+# - 高性能数据库：15-20，共享数据库：5-10
+concurrency.level=10
+
+# 批量配置：批量写入的记录数
+# - 值越大写入性能越好，但内存占用越大
+# - 建议范围：200-1000，默认：500
+# - 高数据量场景：500-1000，低内存环境：200-500
+batch.size=500
+
+# 结果队列容量：存储待写入统计结果的缓冲区大小
+# - 建议为 batch.size 的 4-10 倍
+# - 公式：result.queue.capacity ≥ batch.size × 4
+# - batch.size=500 时，建议：2000-5000
+result.queue.capacity=2000
+
+# 分页配置：每次查询的表数量
+# - 值越大查询次数越少，但内存占用越大
+# - 建议范围：500-2000，默认：1000
+# - 表数量多时用 1000-2000，表数量少时用 500-1000
+page.size=1000
+
+# 任务队列容量：存储待执行 ANALYZE 命令的队列大小
+# - 必须大于等于总表数量
+# - 建议为总表数量的 1.5-2 倍
+# - 表数量 <10000：50000-100000，表数量 >10000：100000+
+task.queue.capacity=100000
 ```
+
+**统计级别配置：**
+```properties
+analyze.level=partition       # 统计级别: partition(分区级别,默认) 或 table(表级别)
+```
+
+| 配置值 | 说明 | 统计内容 | 使用场景 |
+|--------|------|----------|----------|
+| `partition` | 分区级别（默认） | 统计表级别和所有分区级别的统计信息 | 需要详细的分区级别统计信息，适合分区表较多的场景 |
+| `table` | 表级别 | 只统计表级别的汇总统计信息（不包含分区信息） | 只需要表级别的汇总统计，减少数据量，提高处理速度 |
+
+**统计级别详细说明：**
+
+#### Partition 模式（分区级别，默认）
+
+- **执行命令**：`ANALYZE TABLE table_name COMPUTE STATISTICS;`
+- **统计内容**：
+  - 表级别的汇总统计（一行记录，`partition_name` 为空）
+  - 每个分区的详细统计（每个分区一行记录，`partition_name` 包含分区信息）
+- **数据量**：对于有 N 个分区的表，会产生 N+1 条记录（1条表级别 + N条分区级别）
+- **适用场景**：
+  - 需要监控每个分区的数据变化
+  - 需要分析分区级别的数据分布
+  - 分区表较多且需要详细统计
+
+**示例输出：**
+```
+表级别: default.test_table [numFiles=10, numRows=1000, totalSize=1024000, rawDataSize=1024000]
+分区1:  default.test_table{dt=2023-01-01} [numFiles=5, numRows=500, totalSize=512000, rawDataSize=512000]
+分区2:  default.test_table{dt=2023-01-02} [numFiles=5, numRows=500, totalSize=512000, rawDataSize=512000]
+```
+
+#### Table 模式（表级别）
+
+- **执行命令**：`ANALYZE TABLE table_name COMPUTE STATISTICS;`（相同命令）
+- **统计内容**：
+  - 仅表级别的汇总统计（一行记录，`partition_name` 为空）
+  - 自动过滤掉所有分区级别的统计结果
+- **数据量**：每个表只产生 1 条记录
+- **适用场景**：
+  - 只需要表级别的汇总信息
+  - 减少数据量，提高处理速度
+  - 不需要分区级别的详细统计
+
+**示例输出：**
+```
+表级别: default.test_table [numFiles=10, numRows=1000, totalSize=1024000, rawDataSize=1024000]
+（分区级别的结果会被自动过滤）
+```
+
+**配置建议：**
+- 如果表都是非分区表，两种模式效果相同
+- 如果表都是分区表且需要详细统计，使用 `partition` 模式
+- 如果只需要表级别汇总，使用 `table` 模式可以减少数据量
+- 默认使用 `partition` 模式，保证统计信息的完整性
 
 **查询SQL配置：**
 ```properties
@@ -268,27 +348,95 @@ InceptorStatCollector/
 
 ```properties
 # 数据库连接配置
-jdbc.url=jdbc:hive2://your-host:10000/default;transaction.type=inceptor;hive.server2.idle.session.timeout=64800000;hive.server2.idle.operation.timeout=3600000
+jdbc.url=jdbc:hive2://your_host:10000/default;transaction.type=inceptor;hive.server2.idle.session.timeout=64800000;hive.server2.idle.operation.timeout=3600000
 jdbc.driver=org.apache.hive.jdbc.HiveDriver
 jdbc.username=your_username
 jdbc.password=your_password
 
-# 目标表配置
+#====================== 目标表配置 ======================
+#用于存储统计信息的目标表名称，格式：数据库名.表名
+#- 若该表不存在，程序将自动创建
+#- 表结构会根据 analyze.level 配置项的取值不同而有所差异
+#- 格式示例：数据库名。表名（如 default.inceptor_stats_result_table）
+#- 程序运行前，对应的数据库必须已存在
+#- 该表采用 ORC 格式存储，且支持事务功能
+#- 表按 data_day 字段进行分区（分区粒度为月度）
+#- 表按 id 字段分桶，共分为 11 个桶，以提升查询性能
+#- 可针对不同环境（开发、测试、生产）配置不同的表名
+#- 示例：prod.inceptor_stats_result_table、test.inceptor_stats_result_table
 inceptor.target.table.name=default.inceptor_stats_result_table
 
-# 并发配置
+# 并发配置：并发执行 ANALYZE 的工作线程数
+# - 值越大处理越快，但数据库压力越大
+# - 建议范围：5-20，默认：10
+# - 高性能数据库：15-20，共享数据库：5-10
 concurrency.level=10
 
-# 批量配置
+# 批量配置：批量写入的记录数
+# - 值越大写入性能越好，但内存占用越大
+# - 建议范围：200-1000，默认：500
+# - 高数据量场景：500-1000，低内存环境：200-500
 batch.size=500
+
+# 结果队列容量：存储待写入统计结果的缓冲区大小
+# - 建议为 batch.size 的 4-10 倍
+# - 公式：result.queue.capacity ≥ batch.size × 4
+# - batch.size=500 时，建议：2000-5000
 result.queue.capacity=2000
 
-# 分页配置
+# 分页配置：每次查询的表数量
+# - 值越大查询次数越少，但内存占用越大
+# - 建议范围：500-2000，默认：1000
+# - 表数量多时用 1000-2000，表数量少时用 500-1000
 page.size=1000
+
+# 任务队列容量：存储待执行 ANALYZE 命令的队列大小
+# - 必须大于等于总表数量
+# - 建议为总表数量的 1.5-2 倍
+# - 表数量 <10000：50000-100000，表数量 >10000：100000+
 task.queue.capacity=100000
 
-# 查询SQL配置:用于从inceptor的系统字典表system.tables_v中获取所有的表清单
-# 如果不需要对某类型的表进行统计，写入NOT IN中，以排除掉某些类型的表，比如hyperbase表
+# 超时配置
+#====================== 超时配置 ======================
+#等待所有分析任务完成的超时时间（单位：小时）
+#- 控制程序等待所有 ANALYZE 命令执行完毕的时长
+#- 若达到超时时间，程序会记录一条警告日志，但继续执行后续流程
+#- 建议配置范围：1-24 小时，默认值：2 小时
+#- 适用于数据表数量 < 1000 的系统：1-2 小时
+#- 适用于数据表数量 1000-10000 的系统：2-4 小时
+#- 适用于数据表数量 > 10000 的系统：4-8 小时或更长
+#- 配置为 0 或负数时，程序会无限等待（不推荐此配置）
+#- 应根据数据表总数及单表复杂度调整该参数
+
+analysis.task.timeout.hours=2
+
+#等待批量写入线程完成的超时时间（单位：分钟）
+#- 控制程序等待批量写入器完成所有数据写入的时长
+#- 若达到超时时间，程序会记录一条警告日志，但继续执行后续流程
+#- 建议配置范围：10-120 分钟，默认值：30 分钟
+#- 适用于小数据量场景：15-30 分钟
+#- 适用于中等数据量场景：30-60 分钟
+#- 适用于大数据量场景：60-120 分钟
+#- 该参数值应小于 analysis.task.timeout.hours 对应的分钟数
+#- 示例：若 analysis.task.timeout.hours = 2，则此参数值应小于 120 分钟
+batch.writer.timeout.minutes=30
+
+# 统计级别配置
+# partition: 统计表级别和所有分区级别的统计信息（默认）
+# table: 只统计表级别的汇总统计信息（不包含分区信息）
+analyze.level=table
+
+
+#从 system.tables_v 中获取数据表列表的 SQL 查询语句
+#- 该 SQL 用于查询所有需要采集统计信息的数据表
+#- 必须返回单列结果，且列中数据表名称格式为：数据库名.表名
+#- 程序会自动为每一张匹配的数据表生成对应的 ANALYZE 命令
+#- 可自定义 WHERE 子句，用于排除特定类型的数据表
+#- 常见的排除类型：hyperbase 表、scope 表、hyperdrive 表等
+#- 也可通过在 NOT IN 子句中添加数据库名，排除指定的数据库
+#- SQL 语法必须与 Inceptor/Hive 兼容
+#- 示例：若要排除 test 数据库，可添加条件：AND database_name not in ('system', 'test')
+#- 示例：若要仅包含指定数据库，可使用条件：AND database_name in ('db1', 'db2')
 table.query.sql=SELECT CONCAT(database_name,'.',table_name) \
   FROM system.tables_v \
   WHERE table_format NOT IN ('io.transwarp.scope.ScopeInputFormat','io.transwarp.hyper2drive.HyperdriveInputFormat','hbase','hyperdrive','org.apache.hadoop.hive.ql.io.tdt.refactor.JDBCDBInputFormat') \
@@ -343,27 +491,541 @@ mvn exec:java
 
 ### 性能配置
 
-| 配置项 | 说明 | 默认值 | 建议值 |
-|--------|------|--------|--------|
-| `concurrency.level` | 并发执行 ANALYZE 的工作线程数 | 10 | 根据数据库性能调整（5-20） |
-| `batch.size` | 批量写入的记录数 | 500 | 根据数据量调整（200-1000） |
-| `result.queue.capacity` | 结果队列容量 | 2000 | 建议为 batch.size 的 4-10 倍 |
-| `page.size` | 分页查询大小 | 1000 | 根据表数量调整 |
-| `task.queue.capacity` | 任务队列容量 | 100000 | 根据表数量调整 |
+| 配置项 | 说明 | 默认值 | 建议值 | 详细说明 |
+|--------|------|--------|--------|----------|
+| `concurrency.level` | 并发执行 ANALYZE 的工作线程数 | 10 | 5-20 | **作用**：控制同时执行 ANALYZE 命令的线程数量<br>**影响**：值越大，处理速度越快，但数据库压力越大<br>**调优**：高性能数据库可设为 15-20，共享数据库建议 5-10<br>**注意**：每个线程会占用一个数据库连接 |
+| `batch.size` | 批量写入的记录数 | 500 | 200-1000 | **作用**：控制每次批量写入目标表的记录数<br>**影响**：值越大，写入性能越好，但内存占用越大<br>**调优**：高数据量场景用 500-1000，低内存环境用 200-500<br>**注意**：需要根据可用内存和网络延迟调整 |
+| `result.queue.capacity` | 结果队列容量 | 2000 | batch.size 的 4-10 倍 | **作用**：结果队列的缓冲区大小，用于存储待写入的统计结果<br>**影响**：值太小会导致工作线程阻塞，值太大会占用过多内存<br>**调优**：建议为 batch.size 的 4-10 倍<br>**公式**：result.queue.capacity ≥ batch.size × 4<br>**示例**：batch.size=500 时，建议设为 2000-5000 |
+| `page.size` | 分页查询大小 | 1000 | 500-2000 | **作用**：控制每次从 system.tables_v 查询的表数量<br>**影响**：值越大，查询次数越少但内存占用越大<br>**调优**：表数量 >10000 时用 1000-2000，<1000 时用 500-1000<br>**注意**：应根据总表数量调整 |
+| `task.queue.capacity` | 任务队列容量 | 100000 | ≥ 总表数 | **作用**：存储待处理的 ANALYZE 命令队列大小<br>**影响**：值太小会导致任务加载阻塞<br>**调优**：至少等于总表数量<br>**公式**：task.queue.capacity ≥ 总表数<br>**示例**：<10000 表用 10000-50000，>10000 表用 100000+ |
+
+**性能配置详细说明：**
+
+#### 1. concurrency.level（并发级别）
+
+**工作原理：**
+- 程序会创建指定数量的工作线程，每个线程独立执行 ANALYZE 命令
+- 每个线程维护自己的数据库连接，从任务队列获取任务并执行
+- 多个线程并发执行，提高整体处理速度
+
+**调优建议：**
+- **高性能数据库**（独立服务器，性能好）：15-20
+- **中等性能数据库**（共享服务器）：10-15
+- **低性能数据库**（资源受限）：5-10
+- **测试环境**：建议从 5 开始，逐步增加
+
+**注意事项：**
+- 值过高可能导致数据库连接数过多，影响数据库性能
+- 值过低会导致处理速度慢，无法充分利用数据库资源
+- 建议根据数据库服务器的 CPU 核心数和性能调整
+
+#### 2. batch.size（批量大小）
+
+**工作原理：**
+- 批量写入线程会收集统计结果，达到 batch.size 数量后一次性写入数据库
+- 使用批量插入（batch insert）提高写入性能
+- 减少数据库交互次数，提高整体吞吐量
+
+**调优建议：**
+- **高数据量场景**（每天产生大量统计结果）：500-1000
+- **中等数据量场景**：300-500
+- **低数据量场景**（或低内存环境）：200-300
+- **网络延迟高**：建议使用较大的批量大小（500-1000）
+
+**注意事项：**
+- 批量大小过大会导致单次写入时间过长，影响实时性
+- 批量大小过小会增加数据库交互次数，降低性能
+- 需要根据可用内存调整，避免内存溢出
+
+#### 3. result.queue.capacity（结果队列容量）
+
+**工作原理：**
+- 结果队列是工作线程和写入线程之间的缓冲区
+- 工作线程将解析后的统计结果放入队列
+- 写入线程从队列取出结果进行批量写入
+
+**调优建议：**
+- **计算公式**：result.queue.capacity ≥ batch.size × 4
+- **推荐倍数**：4-10 倍 batch.size
+- **示例**：
+  - batch.size=200 → result.queue.capacity=800-2000
+  - batch.size=500 → result.queue.capacity=2000-5000
+  - batch.size=1000 → result.queue.capacity=4000-10000
+
+**注意事项：**
+- 容量太小会导致工作线程频繁等待，降低并发效率
+- 容量太大占用内存，但不会显著提升性能
+- 建议设置为 batch.size 的 4-10 倍
+
+#### 4. page.size（分页大小）
+
+**工作原理：**
+- 程序使用分页查询从 system.tables_v 获取表列表
+- 每次查询返回 page.size 条记录
+- 使用 ROW_NUMBER() 窗口函数实现分页（兼容 Hive/Inceptor）
+
+**调优建议：**
+- **表数量 < 1000**：500-1000
+- **表数量 1000-10000**：1000-1500
+- **表数量 > 10000**：1500-2000
+- **表数量非常大（>50000）**：2000-3000
+
+**注意事项：**
+- 分页大小过大会增加单次查询时间，但减少查询次数
+- 分页大小过小会增加查询次数，但单次查询更快
+- 需要根据总表数量和数据库性能平衡
+
+#### 5. task.queue.capacity（任务队列容量）
+
+**工作原理：**
+- 任务队列存储所有待执行的 ANALYZE 命令
+- 程序启动时会将所有表的 ANALYZE 命令加载到队列中
+- 工作线程从队列中获取任务并执行
+
+**调优建议：**
+- **表数量 < 1000**：10000-20000（留有余量）
+- **表数量 1000-10000**：50000-100000
+- **表数量 > 10000**：100000-500000
+- **表数量非常大（>50000）**：500000 或更大
+
+**注意事项：**
+- 容量必须大于等于总表数量，否则会导致任务加载阻塞
+- 建议设置为总表数量的 1.5-2 倍，留有余量
+- 容量过大不会显著影响性能，但会占用少量内存
+
+### 超时配置
+
+| 配置项 | 说明 | 默认值 | 单位 | 建议值 | 详细说明 |
+|--------|------|--------|------|--------|----------|
+| `analysis.task.timeout.hours` | 等待所有分析任务完成的超时时间 | 2 | 小时 | 1-24 | **作用**：控制程序等待所有 ANALYZE 命令完成的最大时间<br>**影响**：超时后会记录警告但继续执行，不会中断程序<br>**调优**：根据表数量和复杂度调整<br>**注意**：设置为 0 或负数会无限等待（不推荐） |
+| `batch.writer.timeout.minutes` | 等待批量写入线程完成的超时时间 | 30 | 分钟 | 10-120 | **作用**：控制程序等待批量写入线程完成的最大时间<br>**影响**：超时后会记录警告但继续执行<br>**调优**：根据数据量调整，应小于 analysis.task.timeout.hours<br>**注意**：建议小于 analysis.task.timeout.hours 的对应分钟数 |
+
+**超时配置详细说明：**
+
+#### 1. analysis.task.timeout.hours（分析任务超时时间）
+
+**工作原理：**
+- 程序启动后，会创建多个工作线程并发执行 ANALYZE 命令
+- 主线程会等待所有工作线程完成所有任务
+- 如果超过此时间仍有任务未完成，程序会记录警告并继续执行后续步骤
+
+**调优建议：**
+- **表数量 < 1000**：1-2 小时
+- **表数量 1000-10000**：2-4 小时
+- **表数量 > 10000**：4-8 小时或更长
+- **表数量非常大（>50000）**：8-24 小时
+
+**影响因素：**
+- 表数量：表越多，需要的时间越长
+- 表大小：大表需要更长的 ANALYZE 时间
+- 分区数量：分区表需要更多时间
+- 数据库性能：数据库性能越好，处理越快
+- 并发级别：并发级别越高，完成越快
+
+**注意事项：**
+- 如果设置为 0 或负数，程序会一直等待直到所有任务完成（不推荐，可能导致程序挂起）
+- 超时不会中断程序执行，只是记录警告日志
+- 建议先使用默认值运行一次，根据实际执行时间调整
+- 对于生产环境，建议设置较长的超时时间，避免因网络波动等原因导致任务中断
+
+**示例场景：**
+```
+场景1：1000 张表，每张表平均 10 个分区
+- 预计时间：1-2 小时
+- 建议配置：analysis.task.timeout.hours=2
+
+场景2：10000 张表，每张表平均 50 个分区
+- 预计时间：4-6 小时
+- 建议配置：analysis.task.timeout.hours=6
+
+场景3：50000 张表，每张表平均 100 个分区
+- 预计时间：12-24 小时
+- 建议配置：analysis.task.timeout.hours=24
+```
+
+#### 2. batch.writer.timeout.minutes（批量写入超时时间）
+
+**工作原理：**
+- 程序使用单独的线程进行批量写入操作
+- 主线程在发送终止信号后，会等待写入线程完成所有数据的写入
+- 如果超过此时间写入线程仍未完成，程序会记录警告
+
+**调优建议：**
+- **数据量较小**（<100万条记录）：15-30 分钟
+- **数据量中等**（100万-1000万条记录）：30-60 分钟
+- **数据量较大**（1000万-1亿条记录）：60-120 分钟
+- **数据量非常大**（>1亿条记录）：120-240 分钟
+
+**影响因素：**
+- 数据量：记录数越多，写入时间越长
+- 批量大小：batch.size 越大，写入越快但单次写入时间越长
+- 数据库写入性能：数据库写入性能越好，完成越快
+- 网络延迟：网络延迟越高，写入越慢
+
+**注意事项：**
+- 此值应该小于 `analysis.task.timeout.hours` 的对应分钟数
+- 例如：如果 `analysis.task.timeout.hours=2`（120分钟），此值应该 < 120 分钟
+- 超时不会中断程序执行，只是记录警告日志
+- 如果经常超时，可以增加此值或减少 `batch.size`
+
+**计算公式：**
+```
+batch.writer.timeout.minutes < analysis.task.timeout.hours × 60
+
+示例：
+- analysis.task.timeout.hours=2 → batch.writer.timeout.minutes < 120
+- analysis.task.timeout.hours=4 → batch.writer.timeout.minutes < 240
+```
+
+**示例场景：**
+```
+场景1：1000 张表，分区级别统计，平均每张表 10 个分区
+- 预计记录数：1000 × (10+1) = 11000 条
+- 预计写入时间：5-10 分钟
+- 建议配置：batch.writer.timeout.minutes=30
+
+场景2：10000 张表，表级别统计
+- 预计记录数：10000 条
+- 预计写入时间：10-20 分钟
+- 建议配置：batch.writer.timeout.minutes=30
+
+场景3：10000 张表，分区级别统计，平均每张表 100 个分区
+- 预计记录数：10000 × (100+1) = 1010000 条
+- 预计写入时间：30-60 分钟
+- 建议配置：batch.writer.timeout.minutes=60
+```
 
 ### 目标表配置
 
-| 配置项 | 说明 | 示例 |
-|--------|------|------|
-| `inceptor.target.table.name` | 存储统计结果的目标表名 | `default.inceptor_stats_result_table` |
+| 配置项 | 说明 | 示例 | 详细说明 |
+|--------|------|------|----------|
+| `inceptor.target.table.name` | 存储统计结果的目标表名 | `default.inceptor_stats_result_table` | **作用**：指定存储统计结果的目标表<br>**格式**：`database.table`（数据库名.表名）<br>**自动创建**：表不存在时会自动创建<br>**表结构**：根据 `analyze.level` 动态生成<br>**存储格式**：ORC 格式，支持事务 |
+
+**目标表配置详细说明：**
+
+#### inceptor.target.table.name（目标表名）
+
+**工作原理：**
+- 程序启动时会检查目标表是否存在
+- 如果表不存在，程序会自动创建表（使用 `CREATE TABLE IF NOT EXISTS`）
+- 表结构会根据 `analyze.level` 配置动态生成
+- 所有统计结果都会写入此表
+
+**表名格式：**
+- **格式要求**：`database.table`（数据库名.表名）
+- **示例**：
+  - `default.inceptor_stats_result_table`（默认数据库）
+  - `stats_db.inceptor_stats_result_table`（自定义数据库）
+  - `prod.inceptor_stats_result_table`（生产环境）
+  - `test.inceptor_stats_result_table`（测试环境）
+
+**表结构说明：**
+
+**分区级别模式（analyze.level=partition）的表结构：**
+```sql
+CREATE TABLE IF NOT EXISTS default.inceptor_stats_result_table (
+    id STRING COMMENT '唯一标识（UUID）',
+    data_time STRING COMMENT '插入时间（格式：yyyy-MM-dd HH:mm:ss）',
+    data_day DATE COMMENT '分区时间（用于表分区）',
+    table_name STRING COMMENT '表名（格式：database.table）',
+    partition_name STRING COMMENT '分区名称（表级别时为空字符串）',
+    is_partition INT COMMENT '是否分区表（0=否，1=是）',
+    numFiles INT COMMENT '文件数',
+    numRows INT COMMENT '行数',
+    totalSize BIGINT COMMENT '总大小（字节）',
+    rawDataSize BIGINT COMMENT '原始数据大小（字节）'
+)
+COMMENT '存放inceptor每张表的统计信息'
+PARTITIONED BY RANGE (data_day)
+INTERVAL (numtoyminterval('1','month'))
+(
+  PARTITION p VALUES LESS THAN ('1970-01-01')
+)
+CLUSTERED BY (id) INTO 11 BUCKETS STORED AS ORC
+TBLPROPERTIES('transactional'='true')
+```
+
+**表级别模式（analyze.level=table）的表结构：**
+```sql
+CREATE TABLE IF NOT EXISTS default.inceptor_stats_result_table (
+    id STRING COMMENT '唯一标识（UUID）',
+    data_time STRING COMMENT '插入时间（格式：yyyy-MM-dd HH:mm:ss）',
+    data_day DATE COMMENT '分区时间（用于表分区）',
+    table_name STRING COMMENT '表名（格式：database.table）',
+    -- 注意：不包含 partition_name 和 is_partition 字段
+    numFiles INT COMMENT '文件数',
+    numRows INT COMMENT '行数',
+    totalSize BIGINT COMMENT '总大小（字节）',
+    rawDataSize BIGINT COMMENT '原始数据大小（字节）'
+)
+COMMENT '存放inceptor每张表的统计信息'
+PARTITIONED BY RANGE (data_day)
+INTERVAL (numtoyminterval('1','month'))
+(
+  PARTITION p VALUES LESS THAN ('1970-01-01')
+)
+CLUSTERED BY (id) INTO 11 BUCKETS STORED AS ORC
+TBLPROPERTIES('transactional'='true')
+```
+
+**表特性说明：**
+
+1. **自动创建**：
+   - 程序启动时会自动检查表是否存在
+   - 如果表不存在，会自动创建表
+   - 如果表已存在，会验证表结构是否匹配当前配置
+   - 表结构会根据 `analyze.level` 配置动态调整
+
+2. **存储格式**：
+   - **ORC 格式**：列式存储，压缩率高，查询性能好
+   - **事务支持**：`transactional='true'`，支持 ACID 事务
+   - **分桶存储**：按 `id` 字段分桶（11个桶），提高查询性能
+
+3. **分区策略**：
+   - **分区字段**：`data_day`（DATE 类型）
+   - **分区类型**：范围分区（RANGE PARTITION）
+   - **分区间隔**：每月一个分区（`INTERVAL (numtoyminterval('1','month'))`）
+   - **自动分区**：根据插入数据的 `data_day` 值自动创建分区
+   - **优势**：按时间分区便于数据管理和查询，可以快速删除历史数据
+
+4. **字段说明**：
+   - `id`：每条记录的唯一标识（UUID）
+   - `data_time`：记录插入时间（字符串格式：yyyy-MM-dd HH:mm:ss）
+   - `data_day`：分区时间（DATE 类型，用于表分区）
+   - `table_name`：被统计的表名（格式：database.table）
+   - `partition_name`：分区名称（仅分区级别模式，表级别时为空）
+   - `is_partition`：是否为分区表（仅分区级别模式，0=否，1=是）
+   - `numFiles`：文件数量
+   - `numRows`：行数
+   - `totalSize`：总大小（字节）
+   - `rawDataSize`：原始数据大小（字节）
+
+**配置建议：**
+
+1. **数据库选择**：
+   - 建议使用独立的数据库存储统计结果，避免与业务数据混在一起
+   - 示例：`stats_db.inceptor_stats_result_table`
+   - 如果使用默认数据库，确保有足够的权限
+
+2. **表名命名**：
+   - 建议使用有意义的表名，便于识别和管理
+   - 可以按环境区分：`prod.inceptor_stats_result`, `test.inceptor_stats_result`
+   - 可以按时间区分：`inceptor_stats_result_2024`, `inceptor_stats_result_2025`
+
+3. **权限要求**：
+   - 程序需要对目标数据库有 CREATE TABLE 权限
+   - 程序需要对目标表有 INSERT 权限
+   - 如果表已存在，需要有 SELECT 权限（用于验证表结构）
+
+4. **表管理**：
+   - 表会自动按月分区，便于数据管理
+   - 可以定期删除历史分区：`ALTER TABLE table_name DROP PARTITION (data_day < '2024-01-01')`
+   - 建议定期清理历史数据，避免表过大影响性能
+
+**注意事项：**
+
+1. **数据库必须存在**：
+   - 目标数据库必须在程序运行前存在
+   - 如果数据库不存在，程序会报错并退出
+   - 可以使用 `CREATE DATABASE IF NOT EXISTS database_name;` 创建数据库
+
+2. **表结构匹配**：
+   - 如果表已存在，程序会验证表结构是否匹配当前配置
+   - 如果表结构不匹配（例如字段数量不同），程序会报错
+   - 建议在切换统计级别前，先删除旧表或使用新的表名
+
+3. **表名格式**：
+   - 必须使用 `database.table` 格式，不能只写表名
+   - 表名不能包含特殊字符（建议使用字母、数字、下划线）
+   - 表名区分大小写（取决于数据库配置）
+
+4. **并发写入**：
+   - 程序使用事务保证数据一致性
+   - 多个程序实例可以同时写入同一张表（不推荐）
+   - 建议同一时间只有一个程序实例运行
+
+5. **数据量管理**：
+   - 表会随时间增长，建议定期清理历史数据
+   - 可以使用分区删除快速清理历史数据
+   - 建议保留最近 3-6 个月的数据
+
+**示例场景：**
+
+**场景1：使用默认数据库**
+```properties
+inceptor.target.table.name=default.inceptor_stats_result_table
+```
+- 表创建在默认数据库中
+- 适合测试环境或小规模使用
+
+**场景2：使用独立数据库**
+```properties
+inceptor.target.table.name=stats_db.inceptor_stats_result_table
+```
+- 表创建在独立的统计数据库中
+- 适合生产环境，便于管理和维护
+
+**场景3：按环境区分**
+```properties
+# 生产环境
+inceptor.target.table.name=prod.inceptor_stats_result_table
+
+# 测试环境
+inceptor.target.table.name=test.inceptor_stats_result_table
+```
+- 不同环境使用不同的表
+- 避免测试数据污染生产数据
+
+**场景4：按时间区分**
+```properties
+# 2024年数据
+inceptor.target.table.name=stats_db.inceptor_stats_result_2024
+
+# 2025年数据
+inceptor.target.table.name=stats_db.inceptor_stats_result_2025
+```
+- 按年度创建不同的表
+- 便于数据归档和管理
+
+### 统计级别配置
+
+| 配置项 | 说明 | 默认值 | 可选值 |
+|--------|------|--------|--------|
+| `analyze.level` | 统计级别 | `partition` | `partition`（分区级别）或 `table`（表级别） |
+
+**详细说明请参考上面的"统计级别配置"章节。**
 
 ### 查询SQL配置
 
-| 配置项 | 说明 |
-|--------|------|
-| `table.query.sql` | 用于查询需要统计的表的 SQL 语句 |
+| 配置项 | 说明 | 详细说明 |
+|--------|------|----------|
+| `table.query.sql` | 用于查询需要统计的表的 SQL 语句 | **作用**：从系统表查询需要统计的表列表<br>**要求**：必须返回单列，格式为 `database.table`<br>**用途**：程序会根据查询结果自动生成 ANALYZE 命令<br>**自定义**：可以通过 WHERE 子句过滤表类型或数据库 |
 
-**注意**：SQL 查询返回的列应该是表名（格式：`database.table`），程序会自动为每个表生成 `ANALYZE TABLE` 命令。
+**查询SQL配置详细说明：**
+
+#### table.query.sql（表查询SQL）
+
+**工作原理：**
+- 程序启动时会执行此 SQL 查询，从 `system.tables_v` 系统表获取需要统计的表列表
+- SQL 必须返回单列，每行是一个表名，格式为：`database.table`
+- 程序会为每个表自动生成 `ANALYZE TABLE database.table COMPUTE STATISTICS;` 命令
+- 使用分页查询（`page.size`）避免一次性加载过多数据
+
+**SQL 要求：**
+1. **返回列数**：必须返回单列（表名）
+2. **表名格式**：格式必须为 `database.table`（使用 `CONCAT(database_name,'.',table_name)`）
+3. **SQL 语法**：必须符合 Inceptor/Hive SQL 语法规范
+4. **性能考虑**：建议添加适当的 WHERE 条件过滤不需要的表
+
+**默认 SQL 说明：**
+```sql
+SELECT CONCAT(database_name,'.',table_name) 
+FROM system.tables_v 
+WHERE table_format NOT IN (
+    'io.transwarp.scope.ScopeInputFormat',
+    'io.transwarp.hyper2drive.HyperdriveInputFormat',
+    'hbase',
+    'hyperdrive',
+    'org.apache.hadoop.hive.ql.io.tdt.refactor.JDBCDBInputFormat'
+) 
+AND database_name not in ('system')
+```
+
+**默认 SQL 排除的表类型：**
+- `ScopeInputFormat`：Scope 表
+- `HyperdriveInputFormat`：Hyperdrive 表
+- `hbase`：HBase 表
+- `hyperdrive`：Hyperdrive 表
+- `JDBCDBInputFormat`：JDBC 外部表
+- `system` 数据库：系统数据库
+
+**自定义 SQL 示例：**
+
+**示例1：排除特定数据库**
+```sql
+SELECT CONCAT(database_name,'.',table_name) 
+FROM system.tables_v 
+WHERE table_format NOT IN ('hbase','hyperdrive')
+  AND database_name not in ('system', 'test', 'temp')
+```
+
+**示例2：只包含特定数据库**
+```sql
+SELECT CONCAT(database_name,'.',table_name) 
+FROM system.tables_v 
+WHERE database_name in ('production', 'staging')
+  AND table_format NOT IN ('hbase','hyperdrive')
+```
+
+**示例3：排除特定表名模式**
+```sql
+SELECT CONCAT(database_name,'.',table_name) 
+FROM system.tables_v 
+WHERE table_format NOT IN ('hbase','hyperdrive')
+  AND database_name not in ('system')
+  AND table_name NOT LIKE '%_temp%'
+  AND table_name NOT LIKE '%_bak%'
+```
+
+**示例4：只统计分区表**
+```sql
+SELECT CONCAT(database_name,'.',table_name) 
+FROM system.tables_v 
+WHERE table_format NOT IN ('hbase','hyperdrive')
+  AND database_name not in ('system')
+  AND partition_count > 0
+```
+
+**示例5：排除视图**
+```sql
+SELECT CONCAT(database_name,'.',table_name) 
+FROM system.tables_v 
+WHERE table_format NOT IN ('hbase','hyperdrive')
+  AND database_name not in ('system')
+  AND table_type = 'TABLE'  -- 排除视图
+```
+
+**调优建议：**
+1. **排除不需要的表类型**：
+   - 在 `NOT IN` 子句中添加不需要的表格式
+   - 常见排除：hyperbase、scope、hyperdrive、hbase 等
+
+2. **排除特定数据库**：
+   - 在 `database_name not in (...)` 中添加不需要的数据库
+   - 常见排除：system、test、temp、backup 等
+
+3. **只包含特定数据库**：
+   - 使用 `database_name in (...)` 只查询需要的数据库
+   - 适用于只需要统计部分数据库的场景
+
+4. **性能优化**：
+   - 添加适当的 WHERE 条件减少查询结果
+   - 避免使用复杂的 JOIN 或子查询
+   - 确保 SQL 能够利用索引（如果 system.tables_v 有索引）
+
+**注意事项：**
+- SQL 必须返回单列，否则程序会报错
+- 表名格式必须为 `database.table`，不能只是表名
+- 如果 SQL 语法错误，程序启动时会报错并退出
+- 修改 SQL 后需要重启程序才能生效
+- 建议先在数据库中测试 SQL 是否正确，再配置到文件中
+- 如果查询结果为空，程序会正常退出（没有表需要统计）
+
+**常见问题：**
+
+**问题1：SQL 返回多列**
+- **错误**：`SELECT database_name, table_name FROM system.tables_v`
+- **正确**：`SELECT CONCAT(database_name,'.',table_name) FROM system.tables_v`
+
+**问题2：表名格式不正确**
+- **错误**：`SELECT table_name FROM system.tables_v`（只有表名，没有数据库名）
+- **正确**：`SELECT CONCAT(database_name,'.',table_name) FROM system.tables_v`
+
+**问题3：包含不需要的表**
+- **解决**：在 WHERE 子句中添加过滤条件，排除不需要的表类型或数据库
+
+**问题4：SQL 语法错误**
+- **解决**：先在数据库中测试 SQL，确保语法正确后再配置
 
 ## 工作原理
 
@@ -392,10 +1054,39 @@ mvn exec:java
    ↓
 4. 解析 ANALYZE 返回的统计信息
    ↓
-5. 批量写入目标表（批量大小可配置）
+5. 根据 analyze.level 配置过滤结果
+   - partition 模式：保留所有结果（表级别 + 分区级别）
+   - table 模式：只保留表级别结果，过滤分区级别结果
    ↓
-6. 完成所有表的统计
+6. 批量写入目标表（批量大小可配置）
+   ↓
+7. 完成所有表的统计
 ```
+
+### 统计级别处理机制
+
+程序执行 `ANALYZE TABLE table_name COMPUTE STATISTICS;` 命令后，会返回以下格式的结果：
+
+**表级别结果格式：**
+```
+table_name [numFiles=10, numRows=1000, totalSize=1024000, rawDataSize=1024000]
+```
+
+**分区级别结果格式：**
+```
+table_name{partition=value} [numFiles=5, numRows=500, totalSize=512000, rawDataSize=512000]
+```
+
+程序使用正则表达式解析这些结果，并根据 `analyze.level` 配置进行过滤：
+
+- **partition 模式**：处理所有匹配的结果（包括表级别和分区级别）
+- **table 模式**：只处理表级别的结果（过滤掉包含 `{partition}` 的结果）
+
+**数据写入目标表：**
+- `table_name`：表名
+- `partition_name`：分区名称（表级别时为空字符串）
+- `is_partition`：是否为分区表（0=否，1=是）
+- 其他统计字段：`numFiles`、`numRows`、`totalSize`、`rawDataSize`
 
 ### 分页实现
 
@@ -590,12 +1281,73 @@ INFO  Loaded configuration from jar internal
 - 检查 SQL 语法是否符合 Inceptor/Hive 规范
 - 确保查询的表有访问权限
 
+### 5. 统计级别配置问题
+
+**问题**：配置了 `analyze.level=table` 但仍然看到分区级别的数据
+
+**解决方案**：
+- 检查配置文件 `conf/config.properties` 中的 `analyze.level` 配置是否正确
+- 确保配置值为 `table`（小写）
+- 重启程序使配置生效
+- 查看启动日志中的配置信息，确认当前使用的统计级别
+
+**问题**：表级别模式下数据量没有减少
+
+**可能原因**：
+- 表都是非分区表，两种模式效果相同
+- 配置未生效，检查配置文件路径和格式
+- 查看启动日志确认配置是否正确加载
+
+### 6. 超时问题
+
+**问题**：程序提示"Analysis tasks did not complete within timeout period"
+
+**解决方案**：
+- 增加 `analysis.task.timeout.hours` 配置值
+- 检查是否有表分析失败（查看错误日志）
+- 检查数据库连接是否正常
+- 考虑减少 `concurrency.level` 以降低数据库压力
+
+**问题**：程序提示"Batch writer thread did not complete within timeout period"
+
+**解决方案**：
+- 增加 `batch.writer.timeout.minutes` 配置值
+- 检查数据库写入性能
+- 考虑减少 `batch.size` 以降低单次写入压力
+- 检查目标表是否有锁或其他阻塞操作
+
+**问题**：如何设置合适的超时时间？
+
+**建议**：
+- 先使用默认值运行一次，观察实际执行时间
+- 如果经常超时，根据实际执行时间增加 20-50% 的缓冲时间
+- 对于生产环境，建议设置较长的超时时间，避免因网络波动等原因导致任务中断
+- 表数量 < 1000：建议 `analysis.task.timeout.hours=1-2`
+- 表数量 1000-10000：建议 `analysis.task.timeout.hours=2-4`
+- 表数量 > 10000：建议 `analysis.task.timeout.hours=4-8` 或更长
+
 ## 性能优化建议
 
 1. **并发级别**：根据数据库服务器性能调整，建议从 5-10 开始，逐步增加
 2. **批量大小**：根据网络延迟和数据库性能调整，建议 200-1000
 3. **队列容量**：结果队列容量应至少为批量大小的 4 倍
 4. **连接池**：程序已自动配置连接池，分析和写入使用独立连接池
+5. **统计级别**：
+   - 如果只需要表级别汇总，使用 `analyze.level=table` 可以减少数据量
+   - 如果表都是分区表且需要详细统计，使用 `analyze.level=partition`（默认）
+   - 表级别模式可以减少约 50-90% 的数据量（取决于分区数量）
+   - 对于有大量分区的表，表级别模式可以显著提高处理速度
+6. **超时配置**：
+   - `analysis.task.timeout.hours`：根据表数量和复杂度调整
+     - 表数量 < 1000：建议 1-2 小时
+     - 表数量 1000-10000：建议 2-4 小时
+     - 表数量 > 10000：建议 4-8 小时或更长
+   - `batch.writer.timeout.minutes`：根据数据量调整
+     - 数据量较小：建议 15-30 分钟
+     - 数据量较大：建议 30-60 分钟
+     - 数据量非常大：建议 60-120 分钟
+   - 如果任务经常超时，可以适当增加超时时间
+   - 建议先使用默认值运行，根据实际执行时间调整
 
 ## 依赖项
 
@@ -609,6 +1361,21 @@ INFO  Loaded configuration from jar internal
 本项目仅供内部使用。
 
 ## 更新日志
+
+### v1.3
+- ✅ 添加超时配置功能
+- ✅ `analysis.task.timeout.hours`：分析任务完成超时时间（小时），默认 2 小时
+- ✅ `batch.writer.timeout.minutes`：批量写入线程完成超时时间（分钟），默认 30 分钟
+- ✅ 超时配置支持默认值，未配置时使用默认值
+- ✅ 日志输出显示实际配置的超时时间
+
+### v1.2
+- ✅ 添加统计级别配置功能（`analyze.level`）
+- ✅ 支持表级别和分区级别两种统计模式
+- ✅ 默认使用分区级别统计（`partition`）
+- ✅ 表级别模式自动合并分区统计信息，减少数据量
+- ✅ 表级别模式下结果表不包含 `partition_name` 和 `is_partition` 字段
+- ✅ 配置项支持默认值，未配置时使用默认值
 
 ### v1.1
 - ✅ 添加详细的日志输出功能

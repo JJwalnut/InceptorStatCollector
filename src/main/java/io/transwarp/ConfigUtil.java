@@ -51,12 +51,35 @@ public class ConfigUtil {
         return value.trim();
     }
 
+    // 获取字符串配置（带默认值）
+    public static String getString(String key, String defaultValue) {
+        String value = props.getProperty(key);
+        if (value == null) {
+            return defaultValue;
+        }
+        return value.trim();
+    }
+
     // 获取整数配置
     public static int getInt(String key) {
         try {
             return Integer.parseInt(getString(key));
         } catch (NumberFormatException e) {
             throw new RuntimeException("Configuration item format error: " + key, e);
+        }
+    }
+
+    // 获取整数配置（带默认值）
+    public static int getInt(String key, int defaultValue) {
+        String value = props.getProperty(key);
+        if (value == null) {
+            return defaultValue;
+        }
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            logger.warn("Configuration item format error: {}, using default value: {}", key, defaultValue);
+            return defaultValue;
         }
     }
 }
