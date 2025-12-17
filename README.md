@@ -4,14 +4,17 @@
 
 ## 功能特性
 
-- ✅ **自动发现表**：从 `system.tables_v` 系统表自动查询需要统计的表
+- ✅ **自动发现表**：从 `system.tables_v` 系统表自动查询需要统计的表，或从文件读取指定表清单
+- ✅ **多种表清单来源**：支持从数据库查询（SQL）或从文件读取（File）两种方式获取表清单
 - ✅ **并发执行**：支持多线程并发执行 ANALYZE 命令，提高效率
 - ✅ **批量写入**：使用批量插入和事务管理，优化写入性能
-- ✅ **分页加载**：使用 ROW_NUMBER() 窗口函数实现分页，避免一次性加载过多数据
+- ✅ **分页加载**：使用 ROW_NUMBER() 窗口函数实现分页，避免一次性加载过多数据，支持大规模表统计（2万+表）
 - ✅ **异常处理**：完善的异常处理机制，单个表失败不影响整体流程
-- ✅ **连接池管理**：使用 HikariCP 连接池，分离分析和写入连接池
+- ✅ **失败表记录**：自动记录执行失败的表名和日期，方便后续重跑
+- ✅ **连接池管理**：使用 HikariCP 连接池，分离分析和写入连接池，支持连接超时配置
 - ✅ **详细日志**：提供详细的执行日志，包括启动配置、任务进度、统计信息等，所有日志均为英文，避免乱码问题
 - ✅ **灵活统计级别**：支持表级别和分区级别两种统计模式，可通过配置灵活切换，默认分区级别统计
+- ✅ **SQL注入防护**：自动验证和清理表名，防止SQL注入攻击
 
 ## 收集的统计信息
 
@@ -126,6 +129,8 @@ bin\start.bat
 | 文件 | 说明 | 必需 |
 |------|------|------|
 | `config.properties` | 数据库连接和运行参数配置 | ✅ 是 |
+| `tables.txt` | 表清单文件（当 `table.source.mode=file` 时使用） | ⚠️ 条件必需 |
+| `failed_tables.txt` | 失败表记录文件（自动生成） | ❌ 否 |
 
 **配置文件说明：**
 
@@ -426,21 +431,50 @@ batch.writer.timeout.minutes=30
 # table: 只统计表级别的汇总统计信息（不包含分区信息）
 analyze.level=table
 
+#====================== 数据表来源配置 ======================
+#数据表来源模式：sql（从数据库查询，默认模式）或 file（从文件读取）
+#sql 模式：使用 table.query.sql 配置的语句从 system.tables_v 中查询数据表
+#file 模式：从 table.list.file 配置的文件中读取数据表列表
+table.source.mode=sql
 
-#从 system.tables_v 中获取数据表列表的 SQL 查询语句
-#- 该 SQL 用于查询所有需要采集统计信息的数据表
-#- 必须返回单列结果，且列中数据表名称格式为：数据库名.表名
-#- 程序会自动为每一张匹配的数据表生成对应的 ANALYZE 命令
-#- 可自定义 WHERE 子句，用于排除特定类型的数据表
-#- 常见的排除类型：hyperbase 表、scope 表、hyperdrive 表等
-#- 也可通过在 NOT IN 子句中添加数据库名，排除指定的数据库
-#- SQL 语法必须与 Inceptor/Hive 兼容
-#- 示例：若要排除 test 数据库，可添加条件：AND database_name not in ('system', 'test')
-#- 示例：若要仅包含指定数据库，可使用条件：AND database_name in ('db1', 'db2')
+# ====================== Query SQL Configuration ======================
+# SQL query for getting table list from system.tables_v (used when table.source.mode=sql)
+# - 该 SQL 用于查询所有需要采集统计信息的数据表
+# - 必须返回单列结果，且列中数据表名称格式为：数据库名.表名
+# - 程序会自动为每一张匹配的数据表生成对应的 ANALYZE 命令
+# - 可自定义 WHERE 子句，用于排除特定类型的数据表
+# - 常见的排除类型：hyperbase 表、scope 表、hyperdrive 表等
+# - 也可通过在 NOT IN 子句中添加数据库名，排除指定的数据库
+# - SQL 语法必须与 Inceptor/Hive 兼容
+# - 示例：若要排除 test 数据库，可添加条件：AND database_name not in ('system', 'test')
+# - 示例：若要仅包含指定数据库，可使用条件：AND database_name in ('db1', 'db2')
 table.query.sql=SELECT CONCAT(database_name,'.',table_name) \
   FROM system.tables_v \
   WHERE table_format NOT IN ('io.transwarp.scope.ScopeInputFormat','io.transwarp.hyper2drive.HyperdriveInputFormat','hbase','hyperdrive','org.apache.hadoop.hive.ql.io.tdt.refactor.JDBCDBInputFormat') \
     AND database_name not in ('system')
+
+#====================== 数据表清单文件配置 ======================
+#数据表清单文件路径（仅在 table.source.mode = file 时生效）
+#文件格式：每行一个数据表，格式为：数据库名.表名
+#支持空行和注释行（以 # 开头的行）
+#文件位置：
+#  - 相对路径（如 tables.txt）：文件放在程序运行的当前工作目录下（通常与 conf/ 目录同级）
+#  - 相对路径（如 conf/tables.txt）：文件放在 conf/ 目录下
+#  - 绝对路径（如 /opt/inceptor-stat-collector/tables.txt）：文件放在指定绝对路径
+#示例：
+## 这是一条注释
+#default.table1
+#default.table2
+#prod.user_table
+table.list.file=tables.txt
+
+#====================== 失败表记录配置 ======================
+#失败表记录文件路径（记录执行失败的表名和日期）
+#文件格式：每行一条记录，格式为：表名,失败日期（例如：db.table,2025-12-16）
+#该文件可以作为 table.list.file 的输入，通过 table.source.mode=file 模式重跑失败的表
+#提取表名：可以使用第一列（表名）创建新的表清单文件
+#默认：conf/failed_tables.txt
+failed.tables.file=conf/failed_tables.txt
 ```
 
 ### 3. 运行程序
@@ -574,6 +608,10 @@ mvn exec:java
 - 分页大小过大会增加单次查询时间，但减少查询次数
 - 分页大小过小会增加查询次数，但单次查询更快
 - 需要根据总表数量和数据库性能平衡
+- **分页判断逻辑**：程序基于数据库实际返回的记录数判断是否还有更多数据
+  - 如果返回记录数等于 `page.size`，继续查询下一页
+  - 如果返回记录数小于 `page.size`，表示已经是最后一页
+- **重要**：即使某些记录验证失败被跳过，程序也能正确判断是否还有更多数据，确保加载所有表
 
 #### 5. task.queue.capacity（任务队列容量）
 
@@ -592,6 +630,8 @@ mvn exec:java
 - 容量必须大于等于总表数量，否则会导致任务加载阻塞
 - 建议设置为总表数量的 1.5-2 倍，留有余量
 - 容量过大不会显著影响性能，但会占用少量内存
+- **重要**：如果表数量很大（>10000），必须确保队列容量足够大，否则 `queue.put()` 会阻塞等待，影响分页加载
+- 如果队列满了，任务加载线程会等待工作线程处理，这是正常现象，不会导致数据丢失
 
 ### 超时配置
 
@@ -599,6 +639,16 @@ mvn exec:java
 |--------|------|--------|------|--------|----------|
 | `analysis.task.timeout.hours` | 等待所有分析任务完成的超时时间 | 2 | 小时 | 1-24 | **作用**：控制程序等待所有 ANALYZE 命令完成的最大时间<br>**影响**：超时后会记录警告但继续执行，不会中断程序<br>**调优**：根据表数量和复杂度调整<br>**注意**：设置为 0 或负数会无限等待（不推荐） |
 | `batch.writer.timeout.minutes` | 等待批量写入线程完成的超时时间 | 30 | 分钟 | 10-120 | **作用**：控制程序等待批量写入线程完成的最大时间<br>**影响**：超时后会记录警告但继续执行<br>**调优**：根据数据量调整，应小于 analysis.task.timeout.hours<br>**注意**：建议小于 analysis.task.timeout.hours 的对应分钟数 |
+
+### 失败表记录配置
+
+| 配置项 | 说明 | 默认值 | 详细说明 |
+|--------|------|--------|----------|
+| `failed.tables.file` | 失败表记录文件路径 | `conf/failed_tables.txt` | **作用**：记录执行失败的表名和日期<br>**格式**：每行一条记录，格式为 `table_name,failed_date`（例如：`db.table,2025-12-16`）<br>**用途**：可以提取表名作为 `table.list.file` 的输入，通过 `table.source.mode=file` 模式重跑失败的表<br>**文件位置**：可以使用相对路径或绝对路径<br>**注意**：文件会自动创建，如果目录不存在会自动创建目录 |
+
+| 配置项 | 说明 | 默认值 | 详细说明 |
+|--------|------|--------|----------|
+| `failed.tables.file` | 失败表记录文件路径 | `conf/failed_tables.txt` | **作用**：记录执行失败的表名和日期<br>**格式**：每行一条记录，格式为 `table_name,failed_date`（例如：`db.table,2025-12-16`）<br>**用途**：可以提取表名作为 `table.list.file` 的输入，通过 `table.source.mode=file` 模式重跑失败的表<br>**文件位置**：可以使用相对路径或绝对路径<br>**注意**：文件会自动创建，如果目录不存在会自动创建目录 |
 
 **超时配置详细说明：**
 
@@ -895,11 +945,17 @@ inceptor.target.table.name=stats_db.inceptor_stats_result_2025
 
 **详细说明请参考上面的"统计级别配置"章节。**
 
-### 查询SQL配置
+### 表清单来源配置
+
+| 配置项 | 说明 | 默认值 | 可选值 | 详细说明 |
+|--------|------|--------|--------|----------|
+| `table.source.mode` | 表清单来源模式 | `sql` | `sql`（从数据库查询）或 `file`（从文件读取） | **作用**：选择获取表清单的方式<br>**sql**：使用 `table.query.sql` 从数据库查询表列表<br>**file**：从 `table.list.file` 指定的文件读取表列表 |
+
+### 查询SQL配置（table.source.mode=sql 时使用）
 
 | 配置项 | 说明 | 详细说明 |
 |--------|------|----------|
-| `table.query.sql` | 用于查询需要统计的表的 SQL 语句 | **作用**：从系统表查询需要统计的表列表<br>**要求**：必须返回单列，格式为 `database.table`<br>**用途**：程序会根据查询结果自动生成 ANALYZE 命令<br>**自定义**：可以通过 WHERE 子句过滤表类型或数据库 |
+| `table.query.sql` | 用于查询需要统计的表的 SQL 语句 | **作用**：从系统表查询需要统计的表列表<br>**要求**：必须返回单列，格式为 `database.table`<br>**用途**：程序会根据查询结果自动生成 ANALYZE 命令<br>**自定义**：可以通过 WHERE 子句过滤表类型或数据库<br>**注意**：仅在 `table.source.mode=sql` 时生效 |
 
 **查询SQL配置详细说明：**
 
@@ -1027,6 +1083,147 @@ WHERE table_format NOT IN ('hbase','hyperdrive')
 **问题4：SQL 语法错误**
 - **解决**：先在数据库中测试 SQL，确保语法正确后再配置
 
+### 表清单文件配置（table.source.mode=file 时使用）
+
+| 配置项 | 说明 | 默认值 | 详细说明 |
+|--------|------|--------|----------|
+| `table.list.file` | 表清单文件路径 | `tables.txt` | **作用**：指定包含表清单的文件路径<br>**格式**：每行一个表名，格式为 `database.table`<br>**支持**：空行和注释（以 `#` 开头的行）<br>**注意**：仅在 `table.source.mode=file` 时生效 |
+
+**表清单文件配置详细说明：**
+
+#### table.list.file（表清单文件）
+
+**工作原理：**
+- 当 `table.source.mode=file` 时，程序会从指定文件读取表清单
+- 文件格式：每行一个表名，格式为 `database.table`
+- 支持空行和注释（以 `#` 开头的行会被忽略）
+- 程序会为每个表自动生成 `ANALYZE TABLE database.table COMPUTE STATISTICS;` 命令
+- 表名会经过格式验证，不符合格式的表会被跳过并记录警告
+
+**文件格式要求：**
+1. **表名格式**：必须是 `database.table` 格式（使用点号分隔）
+2. **编码**：文件必须使用 UTF-8 编码
+3. **注释**：以 `#` 开头的行会被忽略
+4. **空行**：空行会被忽略
+5. **路径**：可以使用相对路径或绝对路径
+
+**文件示例：**
+```text
+# This is a comment line
+# Table list file for statistics collection
+
+# Production tables
+prod.user_table
+prod.order_table
+prod.product_table
+
+# Test tables
+test.user_table
+test.order_table
+
+# Default database tables
+default.log_table
+default.config_table
+```
+
+**文件位置说明：**
+
+**重要**：`tables.txt` 文件的位置取决于配置中的路径设置：
+
+1. **相对路径**（推荐）：
+   - 如果配置为 `table.list.file=tables.txt`（相对路径）
+   - 文件应放在**程序运行的当前工作目录**下
+   - 通常与 `conf/`、`bin/`、`libs/` 目录同级
+   - 示例目录结构：
+     ```
+     InceptorStatCollector/
+     ├── bin/
+     ├── libs/
+     ├── conf/
+     │   └── config.properties
+     └── tables.txt          ← 文件放在这里（项目根目录）
+     ```
+
+2. **绝对路径**：
+   - 如果配置为 `table.list.file=/opt/inceptor-stat-collector/tables.txt`（绝对路径）
+   - 文件放在指定的绝对路径下
+   - 适合生产环境，便于统一管理
+
+**配置示例：**
+
+**示例1：使用相对路径（推荐）**
+```properties
+table.source.mode=file
+table.list.file=tables.txt
+```
+- 文件放在程序运行目录下（与 `conf/` 目录同级）
+- 适合单机部署
+- **推荐位置**：项目根目录，与 `conf/config.properties` 一起管理
+
+**示例2：使用相对路径（放在conf目录）**
+```properties
+table.source.mode=file
+table.list.file=conf/tables.txt
+```
+- 文件放在 `conf/` 目录下，与配置文件一起管理
+- 便于配置和表清单文件统一管理
+- 示例目录结构：
+  ```
+  InceptorStatCollector/
+  ├── bin/
+  ├── libs/
+  └── conf/
+      ├── config.properties
+      └── tables.txt          ← 文件放在conf目录下
+  ```
+
+**示例3：使用绝对路径**
+```properties
+table.source.mode=file
+table.list.file=/opt/inceptor-stat-collector/tables.txt
+```
+- 文件位于指定绝对路径
+- 适合生产环境，便于统一管理
+
+**示例3：按环境区分**
+```properties
+# 生产环境
+table.source.mode=file
+table.list.file=/opt/inceptor-stat-collector/tables-prod.txt
+
+# 测试环境
+table.source.mode=file
+table.list.file=/opt/inceptor-stat-collector/tables-test.txt
+```
+- 不同环境使用不同的表清单文件
+- 便于管理和维护
+
+**使用场景：**
+1. **指定表统计**：只需要统计特定的表，而不是所有表
+2. **临时统计**：需要临时统计某些表，不想修改 SQL 查询
+3. **批量统计**：需要统计一批表，但不想每次都修改配置
+4. **测试环境**：测试时只需要统计少量表
+
+**注意事项：**
+- 文件不存在时，程序会报错并退出
+- 表名格式不正确时，会被跳过并记录警告
+- 文件为空或所有表都被跳过时，程序会正常退出（没有表需要统计）
+- 建议定期检查日志，确认所有表都被正确加载
+
+**常见问题：**
+
+**问题1：文件找不到**
+- **错误**：`Table list file not found: tables.txt`
+- **解决**：检查文件路径是否正确，文件是否存在
+
+**问题2：表名格式不正确**
+- **错误**：`Skipping invalid table name format at line X: table_name`
+- **解决**：确保表名格式为 `database.table`，不能只有表名
+
+**问题3：文件编码问题**
+- **错误**：文件读取时出现乱码
+- **解决**：确保文件使用 UTF-8 编码保存
+
 ## 工作原理
 
 ### 架构设计
@@ -1046,11 +1243,17 @@ WHERE table_format NOT IN ('hbase','hyperdrive')
 ### 执行流程
 
 ```
-1. 从 system.tables_v 分页查询表列表
+1. 根据 table.source.mode 配置选择表清单来源
+   - sql 模式：从 system.tables_v 分页查询表列表
+   - file 模式：从 table.list.file 文件读取表列表
    ↓
 2. 生成 ANALYZE TABLE 命令并加入任务队列
+   - 验证表名格式，防止SQL注入
+   - 如果队列满，会等待工作线程处理
    ↓
 3. 多个工作线程并发执行 ANALYZE 命令
+   - 执行失败的表会自动记录到 failed.tables.file
+   - 单个表失败不影响其他表的处理
    ↓
 4. 解析 ANALYZE 返回的统计信息
    ↓
@@ -1061,6 +1264,7 @@ WHERE table_format NOT IN ('hbase','hyperdrive')
 6. 批量写入目标表（批量大小可配置）
    ↓
 7. 完成所有表的统计
+   - 输出统计信息：总任务数、成功数、失败数等
 ```
 
 ### 统计级别处理机制
@@ -1098,6 +1302,18 @@ SELECT table_name FROM (
   FROM (基础查询SQL) base
 ) t WHERE rn > offset AND rn <= offset + pageSize
 ```
+
+**分页逻辑说明：**
+- 程序会逐页查询，直到某一页返回的记录数小于 `page.size`，表示已经是最后一页
+- 判断逻辑基于数据库实际返回的记录数（`returned`），而不是成功加入队列的记录数（`valid`）
+- 即使某些记录验证失败被跳过，也能正确判断是否还有更多数据
+- 支持大规模表统计（2万+表），不会因为部分记录无效而提前停止
+
+**分页日志输出：**
+- 每页加载完成后会输出日志：`Loaded analysis tasks, page: X, returned: Y, valid: Z, total so far: W`
+- `returned`：数据库实际返回的记录数（用于判断是否还有更多数据）
+- `valid`：成功加入队列的记录数（验证通过的）
+- `total`：累计加载的总任务数
 
 ## 目标表结构
 
@@ -1266,6 +1482,34 @@ INFO  Loaded configuration from jar internal
 
 程序会记录错误日志，但不会中断整体流程。
 
+**失败表记录功能：**
+- 程序会自动将执行失败的表名和日期记录到 `failed.tables.file` 指定的文件中
+- 文件格式：`table_name,failed_date`（例如：`db.table,2025-12-16`）
+- 可以使用该文件作为 `table.list.file` 的输入，通过 `table.source.mode=file` 模式重跑失败的表
+- 默认文件位置：`conf/failed_tables.txt`
+
+**重跑失败表的步骤：**
+1. 查看 `conf/failed_tables.txt` 文件，确认失败的表
+2. 提取表名（第一列），创建新的表清单文件（或直接使用该文件）
+3. 配置 `table.source.mode=file` 和 `table.list.file=新文件路径`
+4. 重新运行程序
+
+**示例：**
+```bash
+# 1. 查看失败表记录文件
+cat conf/failed_tables.txt
+# 输出：
+# db1.table1,2025-12-16
+# db2.table2,2025-12-16
+
+# 2. 提取表名创建新的表清单文件（只提取第一列）
+cut -d',' -f1 conf/failed_tables.txt > conf/retry_tables.txt
+
+# 3. 修改配置文件，设置 table.source.mode=file 和 table.list.file=conf/retry_tables.txt
+
+# 4. 重新运行程序
+```
+
 ### 3. 内存不足
 
 如果遇到内存问题：
@@ -1280,6 +1524,31 @@ INFO  Loaded configuration from jar internal
 - 确保配置的 `table.query.sql` 返回单列（表名）
 - 检查 SQL 语法是否符合 Inceptor/Hive 规范
 - 确保查询的表有访问权限
+
+**分页加载不完整问题：**
+- **问题**：表有2万多张，但只加载了部分表（如1985张）就停止了
+- **原因**：可能是分页判断逻辑问题，或队列容量不足
+- **解决方案**：
+  1. 检查日志中的分页加载信息，确认实际加载了多少页
+  2. 确保 `task.queue.capacity` 足够大（建议 >= 总表数 × 1.5）
+  3. 检查是否有大量表名验证失败（查看日志中的警告信息）
+  4. 如果使用SQL模式，确保 `page.size` 配置合理（建议1000-2000）
+  5. 查看日志中的 `returned` 和 `valid` 数量，如果差异很大，说明有大量无效表名
+
+**示例排查步骤：**
+```bash
+# 1. 查看日志中的分页加载信息
+grep "Loaded analysis tasks" logs/inceptor-stat-collector.log
+
+# 2. 查看是否有大量表名验证失败
+grep "Skipping invalid table name" logs/inceptor-stat-collector.log | wc -l
+
+# 3. 查看最终加载的任务数
+grep "Task loading completed" logs/inceptor-stat-collector.log
+
+# 4. 如果使用SQL模式，可以手动执行SQL验证总表数
+# 在数据库中执行配置的 table.query.sql，查看返回的总记录数
+```
 
 ### 5. 统计级别配置问题
 
@@ -1361,6 +1630,17 @@ INFO  Loaded configuration from jar internal
 本项目仅供内部使用。
 
 ## 更新日志
+
+### v1.4
+- ✅ 添加表清单文件读取功能（`table.source.mode=file`）
+- ✅ 支持从文件读取表清单，便于指定特定表进行统计
+- ✅ 添加失败表记录功能（`failed.tables.file`）
+- ✅ 自动记录执行失败的表名和日期，方便后续重跑
+- ✅ 修复分页加载逻辑，支持大规模表统计（2万+表）
+- ✅ 改进分页判断逻辑，基于数据库实际返回记录数而非成功加入队列数
+- ✅ 添加SQL注入防护，自动验证和清理表名
+- ✅ 增强日志输出，显示分页加载的详细信息（returned/valid/total）
+- ✅ 改进超时处理，超时后优雅关闭连接池，避免连接池关闭错误
 
 ### v1.3
 - ✅ 添加超时配置功能

@@ -55,5 +55,5 @@ echo "启动 InceptorStatCollector..."
 echo "配置文件: $(pwd)/conf/config.properties"
 echo "Jar包目录: $(pwd)/libs"
 echo ""
-java -Dfile.encoding=UTF-8 -Dconsole.encoding=UTF-8 -Duser.language=zh -Duser.country=CN -cp "$CP" io.transwarp.InceptorStatCollector
+java -Dfile.encoding=UTF-8 -Dconsole.encoding=UTF-8 -Duser.language=zh -Duser.country=CN -Xms4g -Xmx8g -cp "$CP" io.transwarp.InceptorStatCollector
 

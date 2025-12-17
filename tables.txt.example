@@ -1,0 +1,18 @@
+# Table List File Example
+# Format: database.table (one table per line)
+# Lines starting with # are comments and will be ignored
+# Empty lines are also ignored
+
+# Production tables
+prod.user_table
+prod.order_table
+prod.product_table
+
+# Test tables
+test.user_table
+test.order_table
+
+# Default database tables
+default.log_table
+default.config_table
+

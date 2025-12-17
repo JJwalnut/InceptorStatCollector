@@ -5,6 +5,7 @@ io\transwarp\InceptorAggregateStatCollector$TableStats.class
 io\transwarp\InceptorAggregateStatCollector$ResultBatchWriter.class
 io\transwarp\InceptorStatCollector$ResultBatchWriter.class
 io\transwarp\ProducerConsumerDemo$Producer.class
+io\transwarp\InceptorStatCollector$FailedTableRecorder.class
 io\transwarp\ConfigUtil.class
 io\transwarp\InceptorAggregateStatCollector$1.class
 io\transwarp\InceptorStatCollector.class
