@@ -282,6 +282,219 @@ mkdir conf bin libs
 - ⚠️ `conf/config.properties` 必须存在且配置正确
 - ✅ 使用启动脚本（`bin/start.sh` 或 `bin/start.bat`）会自动检查这些要求
 
+## 编译和构建
+
+### 前置条件
+
+在编译和构建项目之前，请确保满足以下要求：
+
+1. **Java 环境**：
+   - Java 8 或更高版本
+   - 设置 `JAVA_HOME` 环境变量
+   - 验证：运行 `java -version` 和 `javac -version`
+
+2. **Maven 环境**：
+   - Maven 3.x
+   - 设置 `MAVEN_HOME` 环境变量（可选）
+   - 验证：运行 `mvn -version`
+
+3. **Inceptor JDBC 驱动**：
+   - 下载 `inceptor-driver-8.37.3.jar`
+   - 将驱动文件放到 `libs/` 目录下
+   - ⚠️ **重要**：此驱动不在 Maven 中央仓库，需要手动下载并放置
+
+### 构建步骤
+
+#### 步骤1：准备依赖
+
+**下载 Inceptor JDBC 驱动：**
+1. 从 Inceptor 官方渠道获取 `inceptor-driver-8.37.3.jar`
+2. 将驱动文件复制到项目根目录下的 `libs/` 目录
+3. 如果 `libs/` 目录不存在，请手动创建
+
+**目录结构：**
+```
+InceptorStatCollector/
+├── libs/
+│   └── inceptor-driver-8.37.3.jar    ← 手动放置
+├── pom.xml
+└── src/
+```
+
+#### 步骤2：编译项目
+
+**编译源代码：**
+```bash
+mvn clean compile
+```
+
+**说明：**
+- `clean`：清理之前的编译输出
+- `compile`：编译源代码到 `target/classes` 目录
+- 编译后的类文件位于 `target/classes/io/transwarp/` 目录
+
+**验证编译：**
+- 检查 `target/classes/` 目录是否生成了类文件
+- 检查是否有编译错误（查看控制台输出）
+
+#### 步骤3：运行测试（可选）
+
+**运行单元测试：**
+```bash
+mvn test
+```
+
+**说明：**
+- 如果项目中有测试代码，会执行所有测试
+- 如果没有测试代码，此步骤可以跳过
+
+#### 步骤4：打包项目
+
+**完整打包（推荐）：**
+```bash
+mvn clean package
+```
+
+**打包过程：**
+1. **清理**：删除 `target/` 目录下的旧文件
+2. **编译**：编译源代码
+3. **测试**：运行单元测试（如果有）
+4. **打包**：生成可执行的 jar 文件
+5. **复制文件**：
+   - 复制依赖 jar 包到 `libs/` 目录
+   - 复制主程序 jar 包到 `libs/` 目录
+   - 创建 `conf/` 目录并复制配置文件模板
+
+**打包后的目录结构：**
+```
+InceptorStatCollector/
+├── bin/                    # 启动脚本（已存在）
+├── libs/                   # 所有jar包（打包后自动生成）
+│   ├── InceptorStatCollector-1.0-SNAPSHOT.jar
+│   ├── inceptor-driver-8.37.3.jar
+│   ├── HikariCP-3.4.5.jar
+│   ├── log4j-1.2.17.jar
+│   ├── slf4j-api-1.7.25.jar
+│   └── slf4j-log4j12-1.7.25.jar
+├── conf/                   # 配置文件（打包后自动生成）
+│   └── config.properties
+└── target/                 # Maven 构建输出目录
+    ├── classes/            # 编译后的类文件
+    └── InceptorStatCollector-1.0-SNAPSHOT.jar
+```
+
+### 构建选项
+
+#### 跳过测试打包
+
+如果不需要运行测试，可以跳过测试阶段：
+
+```bash
+mvn clean package -DskipTests
+```
+
+#### 仅编译不打包
+
+如果只需要编译源代码，不需要打包：
+
+```bash
+mvn clean compile
+```
+
+#### 安装到本地仓库
+
+将项目安装到本地 Maven 仓库：
+
+```bash
+mvn clean install
+```
+
+**说明：**
+- 安装后可以在其他 Maven 项目中引用此项目
+- 对于独立运行的项目，通常不需要此步骤
+
+### 构建常见问题
+
+#### 问题1：找不到 inceptor-driver-8.37.3.jar
+
+**错误信息：**
+```
+Could not find artifact io.transwarp:inceptor-driver:jar:8.37.3
+```
+
+**解决方案：**
+1. 确认 `libs/inceptor-driver-8.37.3.jar` 文件存在
+2. 检查文件名是否正确（区分大小写）
+3. 检查文件权限（Linux/Mac需要读取权限）
+
+#### 问题2：编译错误
+
+**可能原因：**
+- Java 版本不匹配（需要 Java 8+）
+- 源代码语法错误
+- 依赖缺失
+
+**解决方案：**
+1. 检查 Java 版本：`java -version`
+2. 查看编译错误信息，修复源代码
+3. 清理后重新编译：`mvn clean compile`
+
+#### 问题3：Maven 下载依赖失败
+
+**可能原因：**
+- 网络连接问题
+- Maven 仓库配置问题
+
+**解决方案：**
+1. 检查网络连接
+2. 配置 Maven 镜像（如使用阿里云镜像）
+3. 检查 `~/.m2/settings.xml` 配置
+
+#### 问题4：打包后缺少文件
+
+**检查清单：**
+- ✅ `libs/` 目录下是否有所有必需的 jar 包
+- ✅ `conf/config.properties` 文件是否存在
+- ✅ `bin/start.sh` 和 `bin/start.bat` 是否存在
+
+**解决方案：**
+- 如果缺少文件，重新运行 `mvn clean package`
+- 检查 `pom.xml` 中的配置是否正确
+
+### 验证构建结果
+
+构建完成后，验证以下内容：
+
+1. **检查 jar 包：**
+   ```bash
+   ls -lh libs/InceptorStatCollector-1.0-SNAPSHOT.jar
+   ```
+
+2. **检查依赖：**
+   ```bash
+   ls -lh libs/*.jar
+   ```
+   应该包含：
+   - InceptorStatCollector-1.0-SNAPSHOT.jar（主程序）
+   - inceptor-driver-8.37.3.jar（Inceptor驱动）
+   - HikariCP-3.4.5.jar（连接池）
+   - log4j-1.2.17.jar（日志）
+   - slf4j-api-1.7.25.jar（日志API）
+   - slf4j-log4j12-1.7.25.jar（SLF4J绑定）
+
+3. **检查配置文件：**
+   ```bash
+   ls -lh conf/config.properties
+   ```
+
+4. **测试运行（可选）：**
+   ```bash
+   # 配置好数据库连接后
+   bin/start.sh  # Linux/Mac
+   # 或
+   bin\start.bat  # Windows
+   ```
+
 ## 快速开始
 
 ### 1. 打包项目
@@ -295,6 +508,8 @@ mvn clean package
 - ✅ 复制所有依赖jar包到 `libs/` 目录
 - ✅ 复制主程序jar包到 `libs/` 目录
 - ✅ 创建 `conf/` 目录并复制配置文件模板到 `conf/config.properties`
+
+**详细说明请参考上面的"编译和构建"章节。**
 
 **打包后的目录结构：**
 ```
