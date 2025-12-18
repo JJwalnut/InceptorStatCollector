@@ -59,6 +59,8 @@ InceptorStatCollector/
 └── README.md                                 # 项目说明文档
 ```
 
+Inceptor JDBC驱动下载：https://pan.baidu.com/s/17_9FgviRhz_xNVFLWmVW8g?pwd=ki8j
+
 ### 部署目录结构（打包后）
 
 运行 `mvn clean package` 后，项目目录结构如下：
@@ -87,8 +89,11 @@ InceptorStatCollector/
 
 | 文件 | 平台 | 说明 |
 |------|------|------|
-| `start.sh` | Linux/Mac | Bash脚本，自动设置UTF-8编码环境变量和Java参数 |
+| `start.sh` | Linux/Mac | Bash脚本，支持前台和后台运行，自动设置UTF-8编码环境变量和Java参数 |
+| `start-daemon.sh` | Linux/Mac | 后台启动脚本，调用start.sh -d参数 |
 | `start.bat` | Windows | 批处理脚本，自动设置控制台代码页为UTF-8 |
+| `stop.sh` | Linux/Mac | 停止脚本，优雅地停止正在运行的程序 |
+| `stop.bat` | Windows | 停止脚本，优雅地停止正在运行的程序 |
 
 **启动脚本功能：**
 - ✅ 自动检查配置文件是否存在
@@ -96,8 +101,11 @@ InceptorStatCollector/
 - ✅ 自动构建classpath（包含libs目录下所有jar包）
 - ✅ 设置UTF-8编码，解决中文乱码问题
 - ✅ 设置Java运行时参数（`-Dfile.encoding=UTF-8`等）
+- ✅ 支持后台运行模式（Linux/Mac），日志输出到文件
 
 **使用方法：**
+
+**前台运行（默认）：**
 ```bash
 # Linux/Mac
 chmod +x bin/start.sh
@@ -106,6 +114,25 @@ bin/start.sh
 # Windows
 bin\start.bat
 ```
+
+**后台运行（Linux/Mac）：**
+```bash
+# 方式1：使用后台启动脚本（推荐）
+chmod +x bin/start-daemon.sh
+bin/start-daemon.sh
+
+# 方式2：使用 start.sh 的 -d 或 --daemon 参数
+bin/start.sh -d
+# 或
+bin/start.sh --daemon
+```
+
+**后台运行特性：**
+- ✅ 使用 `nohup` 确保程序在后台持续运行
+- ✅ 日志自动输出到 `logs/inceptor-stat-collector.log`
+- ✅ PID保存在 `logs/inceptor-stat-collector.pid`
+- ✅ 即使关闭终端，程序也会继续运行
+- ✅ 使用 `bin/stop.sh` 可以优雅地停止程序
 
 #### 📁 `libs/` - 依赖jar包目录
 
@@ -496,13 +523,14 @@ Could not find artifact io.transwarp:inceptor-driver:jar:8.37.3
    bin/start.sh  # Linux/Mac
    # 或
    bin\start.bat  # Windows
+   ```
 ```
 
 ## 快速开始
 
 ### 1. 打包项目
 
-```bash
+​```bash
 mvn clean package
 ```
 
@@ -707,10 +735,43 @@ failed.tables.file=conf/failed_tables.txt
 bin\start.bat
 ```
 
-**Linux/Mac:**
+**Linux/Mac（前台运行）：**
 ```bash
 chmod +x bin/start.sh
 bin/start.sh
+```
+
+**Linux/Mac（后台运行）：**
+```bash
+# 方式1：使用后台启动脚本（推荐）
+chmod +x bin/start-daemon.sh
+bin/start-daemon.sh
+
+# 方式2：使用 start.sh 的 -d 参数
+chmod +x bin/start.sh
+bin/start.sh -d
+
+# 方式3：使用 start.sh 的 --daemon 参数
+bin/start.sh --daemon
+```
+
+**后台运行说明：**
+- ✅ 程序会在后台运行，即使关闭终端也不会停止
+- ✅ 日志输出到 `logs/inceptor-stat-collector.log` 文件
+- ✅ PID保存在 `logs/inceptor-stat-collector.pid` 文件中
+- ✅ 可以使用 `tail -f logs/inceptor-stat-collector.log` 实时查看日志
+- ✅ 使用 `bin/stop.sh` 停止后台运行的程序
+
+**查看后台运行日志：**
+```bash
+# 实时查看日志
+tail -f logs/inceptor-stat-collector.log
+
+# 查看最后100行日志
+tail -n 100 logs/inceptor-stat-collector.log
+
+# 查看日志文件大小
+ls -lh logs/inceptor-stat-collector.log
 ```
 
 #### 方式二：手动运行
@@ -2062,6 +2123,14 @@ grep "Task loading completed" logs/inceptor-stat-collector.log
 本项目仅供内部使用。
 
 ## 更新日志
+
+### v1.8
+- ✅ 添加后台运行支持（Linux/Mac）
+- ✅ start.sh 支持 `-d` 和 `--daemon` 参数，支持后台运行
+- ✅ 创建 start-daemon.sh 后台启动脚本
+- ✅ 后台运行时日志自动输出到 `logs/inceptor-stat-collector.log`
+- ✅ 后台运行时PID保存在 `logs/inceptor-stat-collector.pid`
+- ✅ 更新文档，添加后台运行使用说明
 
 ### v1.7
 - ✅ 使用临时表替代永久执行状态表，实现增量处理和自动恢复
