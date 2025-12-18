@@ -12,6 +12,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -61,6 +62,10 @@ public class InceptorStatCollector {
     private static final String FAILED_TABLES_FILE = ConfigUtil.getString("failed.tables.file", "conf/failed_tables.txt");
     // 失败表记录器（线程安全）
     private static final FailedTableRecorder failedTableRecorder = new FailedTableRecorder(FAILED_TABLES_FILE);
+    // 当前执行日期（格式：yyyy-MM-dd）
+    private static final String CURRENT_EXE_DATE = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd"));
+    // 临时表名（session级别，格式：default.inceptor_execution_status_table_<uuid>）
+    private static final String TEMP_EXECUTION_STATUS_TABLE = "default.inceptor_execution_status_table_" + UUID.randomUUID().toString().replace("-", "");
 
     // 用于解析ANALYZE结果的正则表达式模式
     private static final Pattern RESULT_PATTERN = Pattern.compile(
@@ -122,27 +127,44 @@ public class InceptorStatCollector {
     private static String getCreateTableDDL() {
         StringBuilder ddl = new StringBuilder();
         ddl.append("CREATE TABLE IF NOT EXISTS ").append(TARGET_TABLE_NAME).append(" (\n");
-        ddl.append("    id STRING COMMENT '唯一标识',\n");
-        ddl.append("    data_time STRING COMMENT '插入时间',\n");
-        ddl.append("    data_day DATE COMMENT '分区时间',\n");
-        ddl.append("    table_name STRING COMMENT '表名',\n");
+        ddl.append("    id STRING COMMENT 'Unique identifier',\n");
+        ddl.append("    data_time STRING COMMENT 'Insert time',\n");
+        ddl.append("    data_day DATE COMMENT 'Partition date',\n");
+        ddl.append("    table_name STRING COMMENT 'Table name',\n");
         if ("partition".equals(ANALYZE_LEVEL)) {
             // 分区级别模式：包含 partition_name 和 is_partition 字段
-            ddl.append("    partition_name STRING COMMENT '分区名称',\n");
-            ddl.append("    is_partition INT COMMENT '是否分区表',\n");
+            ddl.append("    partition_name STRING COMMENT 'Partition name',\n");
+            ddl.append("    is_partition INT COMMENT 'Is partition table (1=yes, 0=no)',\n");
         }
-        ddl.append("    numFiles INT COMMENT '文件数',\n");
-        ddl.append("    numRows INT COMMENT '行数',\n");
-        ddl.append("    totalSize BIGINT COMMENT '总大小(字节)',\n");
-        ddl.append("    rawDataSize BIGINT COMMENT '原始数据大小(字节)'\n");
+        ddl.append("    numFiles INT COMMENT 'Number of files',\n");
+        ddl.append("    numRows INT COMMENT 'Number of rows',\n");
+        ddl.append("    totalSize BIGINT COMMENT 'Total size (bytes)',\n");
+        ddl.append("    rawDataSize BIGINT COMMENT 'Raw data size (bytes)'\n");
         ddl.append(")\n");
-        ddl.append("COMMENT '存放inceptor每张表的统计信息'\n");
+        ddl.append("COMMENT 'Statistics information for each Inceptor table'\n");
         ddl.append("PARTITIONED BY RANGE (data_day)\n");
         ddl.append("INTERVAL (numtoyminterval('1','month'))\n");
         ddl.append("(\n");
         ddl.append("  PARTITION p VALUES LESS THAN ('1970-01-01')\n");
         ddl.append(")\n");
         ddl.append("CLUSTERED BY (id) INTO 11 BUCKETS STORED AS ORC\n");
+        ddl.append("TBLPROPERTIES('transactional'='true')");
+        return ddl.toString();
+    }
+    
+    /**
+     * 创建临时执行状态表的DDL（session级别，事务表）
+     * 临时表仅在当前session可见，session结束后会被删除
+     * 用于记录待处理的表清单：uuid, table_name, flag, exe_date
+     */
+    private static String getCreateTempExecutionStatusTableDDL() {
+        StringBuilder ddl = new StringBuilder();
+        ddl.append("CREATE TEMPORARY TABLE ").append(sanitizeTableName(TEMP_EXECUTION_STATUS_TABLE)).append("(\n");
+        ddl.append("    uuid STRING,\n");
+        ddl.append("    table_name STRING,\n");
+        ddl.append("    flag INT,\n");
+        ddl.append("    exe_date DATE\n");
+        ddl.append(") CLUSTERED BY (uuid) INTO 11 BUCKETS STORED AS ORC\n");
         ddl.append("TBLPROPERTIES('transactional'='true')");
         return ddl.toString();
     }
@@ -198,6 +220,7 @@ public class InceptorStatCollector {
         writeConfig.setMaximumPoolSize(2); // 限制写入并发为2，避免数据库压力过大
         logger.info("Write connection pool configured: maxPoolSize=2, timeout={}ms", 30000);
 
+        Connection tempTableConn = null; // 专用连接，用于临时表操作，在整个程序运行期间保持不释放
         try (HikariDataSource analyzeDs = new HikariDataSource(analyzeConfig);
              HikariDataSource writeDs = new HikariDataSource(writeConfig)) {
             logger.info("Connection pools initialized successfully");
@@ -209,6 +232,30 @@ public class InceptorStatCollector {
                 logger.info("Target table created/verified successfully: {}", TARGET_TABLE_NAME);
             } catch (SQLException e) {
                 logger.error("Failed to create table: {}", TARGET_TABLE_NAME, e);
+                throw e;
+            }
+            
+            // 获取一个专用连接用于临时表操作（在整个程序运行期间保持不释放）
+            // 临时表是session级别的，必须在同一个session中创建、插入和查询
+            logger.info("Acquiring dedicated connection for temporary table operations...");
+            tempTableConn = writeDs.getConnection();
+            tempTableConn.setAutoCommit(true); // 设置自动提交，避免事务问题
+            logger.info("Dedicated connection acquired for temporary table operations");
+            
+            // 创建临时执行状态表（session级别）
+            logger.info("Creating temporary execution status table: {} (execution date: {})", TEMP_EXECUTION_STATUS_TABLE, CURRENT_EXE_DATE);
+            try (Statement stmt = tempTableConn.createStatement()) {
+                stmt.execute(getCreateTempExecutionStatusTableDDL());
+                logger.info("Temporary execution status table created successfully: {}", TEMP_EXECUTION_STATUS_TABLE);
+            } catch (SQLException e) {
+                logger.error("Failed to create temporary execution status table: {}", TEMP_EXECUTION_STATUS_TABLE, e);
+                if (tempTableConn != null) {
+                    try {
+                        tempTableConn.close();
+                    } catch (SQLException closeEx) {
+                        logger.warn("Failed to close connection after error", closeEx);
+                    }
+                }
                 throw e;
             }
 
@@ -223,17 +270,29 @@ public class InceptorStatCollector {
             BlockingQueue<String> taskQueue = new LinkedBlockingQueue<>(taskQueueCapacity);
             logger.info("Task queue initialized with capacity: {} (if queue is full, task loading will wait)", taskQueueCapacity);
             
-            // 从系统表或文件加载需要分析的表
-            int totalTasks;
+            // 执行前处理：加载待处理表清单到临时表，并与结果表比较差异
+            logger.info("Preparing temporary execution status table for date: {}", CURRENT_EXE_DATE);
+            
+            // 1. 加载所有待处理的表清单
+            List<String> allTables;
             if ("file".equals(TABLE_SOURCE_MODE)) {
-                logger.info("Loading analysis tasks from file: {}", TABLE_LIST_FILE);
-                totalTasks = loadAnalysisTasksFromFile(taskQueue);
-                logger.info("Total analysis tasks loaded from file: {}", totalTasks);
+                // 文件模式：从文件读取表清单（默认：conf/tables.txt）
+                String tableListFile = ConfigUtil.getString("table.list.file", "conf/tables.txt");
+                logger.info("Loading table list from file: {}", tableListFile);
+                allTables = loadTableListFromFile(tableListFile);
             } else {
-                logger.info("Loading analysis tasks from database...");
-                totalTasks = loadAnalysisTasks(analyzeDs, taskQueue);
-                logger.info("Total analysis tasks loaded from database: {}", totalTasks);
+                // SQL模式：从数据库查询表清单（使用table.query.sql）
+                logger.info("Loading table list from database using table.query.sql...");
+                allTables = loadTableListFromDatabase(analyzeDs);
             }
+            
+            // 2. 将所有待处理的表写入临时表（使用专用连接）
+            insertTablesIntoTempTable(tempTableConn, allTables);
+            logger.info("Inserted {} tables into temporary execution status table", allTables.size());
+            
+            // 3. 使用LEFT JOIN查询未完成的表（临时表中存在但结果表中不存在的表，使用专用连接）
+            int totalTasks = loadPendingTasksFromTempTable(tempTableConn, taskQueue);
+            logger.info("Total analysis tasks loaded: {} (pending tasks after comparing with result table)", totalTasks);
 
             // 初始化工作线程池（并发执行ANALYZE命令）
             logger.info("Starting {} analyze worker threads...", CONCURRENCY);
@@ -303,6 +362,8 @@ public class InceptorStatCollector {
                 }
             }
             
+            // 注意：执行状态表的flag会在写入结果表时自动更新，无需在这里处理
+            
             long programElapsedTime = System.currentTimeMillis() - programStartTime;
             logger.info("========================================");
             logger.info("InceptorStatCollector Completed");
@@ -312,6 +373,16 @@ public class InceptorStatCollector {
 
         } catch (Exception e) {
             logger.error("Main program terminated abnormally", e);
+        } finally {
+            // 关闭临时表专用连接（临时表会在session关闭时自动删除）
+            if (tempTableConn != null) {
+                try {
+                    tempTableConn.close();
+                    logger.info("Temporary table connection closed (temporary table will be automatically deleted)");
+                } catch (SQLException e) {
+                    logger.warn("Failed to close temporary table connection", e);
+                }
+            }
         }
     }
 
@@ -359,7 +430,7 @@ public class InceptorStatCollector {
                         }
                         continue;
                     }
-                    
+
                     try (Connection conn = dataSource.getConnection();
                          Statement stmt = conn.createStatement();
                          ResultSet rs = stmt.executeQuery(sql)) { // 执行ANALYZE并获取结果
@@ -423,11 +494,11 @@ public class InceptorStatCollector {
                             }
                         } else {
                             // 分区级别模式：直接处理所有结果
-                            while (rs.next()) {
-                                String resultLine = rs.getString(1) + " " + rs.getString(2);
-                                Optional<String[]> parsed = parseResultLine(resultLine); // 解析结果行
-                                if (parsed.isPresent()) {
-                                    resultQueue.put(parsed.get());  // 将解析结果放入结果队列
+                        while (rs.next()) {
+                            String resultLine = rs.getString(1) + " " + rs.getString(2);
+                            Optional<String[]> parsed = parseResultLine(resultLine); // 解析结果行
+                            if (parsed.isPresent()) {
+                                resultQueue.put(parsed.get());  // 将解析结果放入结果队列
                                     parsedCount++;
                                 }
                                 count++;
@@ -495,25 +566,25 @@ public class InceptorStatCollector {
     // 结果批量写入线程：负责将统计信息批量写入目标表
     static class ResultBatchWriter implements Runnable {
         private final HikariDataSource dataSource;
-        // 插入SQL语句（根据统计级别动态生成）
-        private static String getInsertSQL() {
-            // 验证目标表名格式（已在getCreateTableDDL中验证，这里再次确认）
+        /**
+         * 获取BATCHINSERT SQL的基础部分（表名和列名）
+         * @return SQL基础部分
+         */
+        private static String getBatchInsertBaseSQL() {
             String safeTableName = sanitizeTableName(TARGET_TABLE_NAME);
             if ("partition".equals(ANALYZE_LEVEL)) {
                 // 分区级别模式：包含 partition_name 和 is_partition 字段
-                return "INSERT INTO " + safeTableName +
+                return "BATCHINSERT INTO " + safeTableName +
                         "(id, data_time, data_day, table_name, partition_name, is_partition, " +
-                        "numFiles, numRows, totalSize, rawDataSize) " +
-                        "VALUES (?,?,?,?,?,?,?,?,?,?)";
+                        "numFiles, numRows, totalSize, rawDataSize) BATCHVALUES (";
             } else {
                 // 表级别模式：不包含 partition_name 和 is_partition 字段
-                return "INSERT INTO " + safeTableName +
+                return "BATCHINSERT INTO " + safeTableName +
                         "(id, data_time, data_day, table_name, " +
-                        "numFiles, numRows, totalSize, rawDataSize) " +
-                        "VALUES (?,?,?,?,?,?,?,?)";
+                        "numFiles, numRows, totalSize, rawDataSize) BATCHVALUES (";
             }
         }
-
+        
         private int totalBatches = 0;
         private int totalRecords = 0;
         private int failedBatches = 0;
@@ -530,7 +601,7 @@ public class InceptorStatCollector {
             
             List<String[]> buffer = new ArrayList<>(BATCH_SIZE);  // 批量写入缓冲区
             try (Connection conn = dataSource.getConnection();
-                 PreparedStatement ps = conn.prepareStatement(getInsertSQL())) {
+                 Statement stmt = conn.createStatement()) {
 
                 conn.setAutoCommit(false); // 禁用自动提交，启用批量提交模式
                 logger.info("Database connection established, auto-commit disabled");
@@ -552,14 +623,14 @@ public class InceptorStatCollector {
                         logger.info("ResultBatchWriter received termination signal, " +
                                 "processing remaining {} records in buffer", buffer.size());
                         if (!buffer.isEmpty()) {
-                            executeBatch(ps, buffer);  // 处理剩余数据
+                            executeBatch(stmt, conn, buffer);  // 处理剩余数据
                         }
                         break;
                     }
 
                     buffer.add(record);   // 将记录添加到缓冲区
                     if (buffer.size() >= BATCH_SIZE) { // 缓冲区满时执行批量写入
-                        executeBatch(ps, buffer);
+                        executeBatch(stmt, conn, buffer);
                     }
                 }
             } catch (Exception e) {
@@ -575,8 +646,8 @@ public class InceptorStatCollector {
                                 writerElapsedTime, writerElapsedTime / 1000));
             }
         }
-        // 执行批量插入操作
-        private void executeBatch(PreparedStatement ps, List<String[]> buffer) throws SQLException {
+        // 执行批量插入操作（使用BATCHINSERT ... BATCHVALUES语法）
+        private void executeBatch(Statement stmt, Connection conn, List<String[]> buffer) throws SQLException {
             totalBatches++;
             int batchSize = buffer.size();
             long batchStartTime = System.currentTimeMillis();
@@ -589,7 +660,10 @@ public class InceptorStatCollector {
             int validRows = 0;
             int invalidRows = 0;
             Set<String> tablesInBatch = new HashSet<>();
+            StringBuilder batchInsertSql = new StringBuilder();
+            batchInsertSql.append(getBatchInsertBaseSQL());
             
+            boolean firstValue = true;
             for (String[] row : buffer) {
                 // 空值安全检查
                 if (row == null || row.length < 6) {
@@ -597,35 +671,51 @@ public class InceptorStatCollector {
                     invalidRows++;
                     continue;
                 }
+                
                 // 提取表名和分区信息
                 String tableName = row[0] != null ? row[0] : "";
                 String partition = row[1] != null ? row[1] : "";
                 tablesInBatch.add(tableName);
                 
-                // 生成UUID
-                String uuid = UUID.randomUUID().toString();
-                // 设置PreparedStatement参数
                 try {
-                    int paramIndex = 1;
-                    ps.setString(paramIndex++, uuid);   // id
-                    ps.setString(paramIndex++, dataTime);                       // data_time
-                    ps.setString(paramIndex++, dataDay);                        // data_day
-                    ps.setString(paramIndex++, tableName);                     // table_name
+                    // 生成UUID
+                    String uuid = UUID.randomUUID().toString();
+                    
+                    // 构建VALUES子句
+                    if (!firstValue) {
+                        batchInsertSql.append(",");
+                    }
+                    batchInsertSql.append("\nVALUES (");
+                    
+                    // id
+                    batchInsertSql.append(escapeSqlString(uuid)).append(",");
+                    // data_time
+                    batchInsertSql.append(escapeSqlString(dataTime)).append(",");
+                    // data_day
+                    batchInsertSql.append(escapeSqlString(dataDay)).append(",");
+                    // table_name
+                    batchInsertSql.append(escapeSqlString(tableName)).append(",");
                     
                     if ("partition".equals(ANALYZE_LEVEL)) {
                         // 分区级别模式：包含 partition_name 和 is_partition 字段
-                        int isPartition = (partition == null || partition.isEmpty()) ? 0 : 1;
                         String partitionName = (partition == null || partition.isEmpty()) ? "" : partition;
-                        ps.setString(paramIndex++, partitionName);              // partition_name
-                        ps.setInt(paramIndex++, isPartition);                   // is_partition
+                        int isPartition = (partition == null || partition.isEmpty()) ? 0 : 1;
+                        batchInsertSql.append(escapeSqlString(partitionName)).append(",");
+                        batchInsertSql.append(isPartition).append(",");
                     }
                     // 表级别模式：不包含 partition_name 和 is_partition 字段
                     
-                    ps.setInt(paramIndex++, parseIntWithDefault(row[2]));       // numFiles
-                    ps.setInt(paramIndex++, parseIntWithDefault(row[3]));       // numRows
-                    ps.setLong(paramIndex++, parseLongWithDefault(row[4]));     // totalSize
-                    ps.setLong(paramIndex++, parseLongWithDefault(row[5]));     // rawDataSize
-                    ps.addBatch();   // 添加到批量操作
+                    // numFiles
+                    batchInsertSql.append(parseIntWithDefault(row[2])).append(",");
+                    // numRows
+                    batchInsertSql.append(parseIntWithDefault(row[3])).append(",");
+                    // totalSize
+                    batchInsertSql.append(parseLongWithDefault(row[4])).append(",");
+                    // rawDataSize
+                    batchInsertSql.append(parseLongWithDefault(row[5]));
+                    
+                    batchInsertSql.append(")");
+                    firstValue = false;
                     validRows++;
                 } catch (Exception e) {
                     logger.error("Failed to process data row: " + Arrays.toString(row), e);
@@ -633,12 +723,24 @@ public class InceptorStatCollector {
                 }
             }
             
+            // 如果没有有效行，直接返回
+            if (validRows == 0) {
+                buffer.clear();
+                return;
+            }
+            
+            // 完成SQL语句
+            batchInsertSql.append(")");
+            String sql = batchInsertSql.toString();
+            
             // 执行批量插入并提交事务
             try {
-                ps.executeBatch();
-                ps.getConnection().commit();
+                stmt.execute(sql);
+                conn.commit();
                 totalRecords += validRows;
                 failedRecords += invalidRows;
+                
+                // 注意：临时表不需要更新flag，因为每次启动都会重新计算未完成的表
                 
                 long batchElapsedTime = System.currentTimeMillis() - batchStartTime;
                 logger.debug("Batch #{} write successful, records: {} (valid: {}, invalid: {}), " +
@@ -653,7 +755,13 @@ public class InceptorStatCollector {
                 String errorMsg = String.format("Batch #%d write failed, count: %d, elapsed: %dms", 
                         totalBatches, batchSize, batchElapsedTime);
                 logger.error(errorMsg, e);
-                ps.getConnection().rollback();  // 写入失败时回滚事务
+                // 记录失败的SQL（截断以避免日志过长）
+                if (sql.length() > 500) {
+                    logger.error("Failed SQL (truncated): {}...", sql.substring(0, 500));
+                } else {
+                    logger.error("Failed SQL: {}", sql);
+                }
+                conn.rollback();  // 写入失败时回滚事务
                 throw e;
             } finally {
                 buffer.clear();  // 清空缓冲区
@@ -784,14 +892,15 @@ public class InceptorStatCollector {
      * 文件格式：每行一个表名，格式为 database.table
      * 支持空行和注释（以 # 开头的行会被忽略）
      * @param queue 任务队列
+     * @param filePathStr 文件路径
      * @return 总任务数
      */
-    private static int loadAnalysisTasksFromFile(BlockingQueue<String> queue) {
-        Path filePath = Paths.get(TABLE_LIST_FILE);
+    private static int loadAnalysisTasksFromFile(BlockingQueue<String> queue, String filePathStr) {
+        Path filePath = Paths.get(filePathStr);
         
         // 检查文件是否存在
         if (!Files.exists(filePath)) {
-            throw new RuntimeException("Table list file not found: " + TABLE_LIST_FILE + 
+            throw new RuntimeException("Table list file not found: " + filePathStr + 
                     ". Please create the file or set table.source.mode=sql to use database query.");
         }
         
@@ -947,4 +1056,183 @@ public class InceptorStatCollector {
             }
         }
     }
+    
+    /**
+     * 将待处理的表清单写入临时表（使用BATCHINSERT语法）
+     * 注意：必须使用创建临时表的同一个连接，因为临时表是session级别的
+     * @param conn 数据库连接（必须与创建临时表的连接是同一个session）
+     * @param tableList 表名列表
+     */
+    private static void insertTablesIntoTempTable(Connection conn, List<String> tableList) {
+        if (tableList.isEmpty()) {
+            logger.warn("Table list is empty, nothing to insert");
+            return;
+        }
+        
+        String baseSql = "BATCHINSERT INTO " + sanitizeTableName(TEMP_EXECUTION_STATUS_TABLE) + 
+                        "(uuid, table_name, flag, exe_date) BATCHVALUES (";
+        
+        try (Statement stmt = conn.createStatement()) {
+            conn.setAutoCommit(false);
+            
+            int totalInserted = 0;
+            int batchStart = 0;
+            
+            while (batchStart < tableList.size()) {
+                int batchEnd = Math.min(batchStart + BATCH_SIZE, tableList.size());
+                List<String> batch = tableList.subList(batchStart, batchEnd);
+                
+                StringBuilder batchInsertSql = new StringBuilder();
+                batchInsertSql.append(baseSql);
+                
+                boolean firstValue = true;
+                for (String tableName : batch) {
+                    if (!firstValue) {
+                        batchInsertSql.append(",");
+                    }
+                    String uuid = UUID.randomUUID().toString();
+                    batchInsertSql.append("\nVALUES (");
+                    batchInsertSql.append(escapeSqlString(uuid)).append(",");
+                    batchInsertSql.append(escapeSqlString(tableName)).append(",");
+                    batchInsertSql.append("0,");  // flag=0 (pending)
+                    batchInsertSql.append(escapeSqlString(CURRENT_EXE_DATE));
+                    batchInsertSql.append(")");
+                    firstValue = false;
+                }
+                
+                batchInsertSql.append(")");
+                String sql = batchInsertSql.toString();
+                
+                stmt.execute(sql);
+                conn.commit();
+                totalInserted += batch.size();
+                batchStart = batchEnd;
+            }
+            
+            logger.info("Inserted {} tables into temporary execution status table", totalInserted);
+        } catch (SQLException e) {
+            logger.error("Failed to insert tables into temporary execution status table", e);
+            throw new RuntimeException("Failed to insert tables into temporary execution status table", e);
+        }
+    }
+    
+    /**
+     * 从文件加载表清单（返回表名列表）
+     * @param filePathStr 文件路径
+     * @return 表名列表
+     */
+    private static List<String> loadTableListFromFile(String filePathStr) {
+        List<String> tableList = new ArrayList<>();
+        Path filePath = Paths.get(filePathStr);
+        
+        if (!Files.exists(filePath)) {
+            throw new RuntimeException("Table list file not found: " + filePathStr);
+        }
+        
+        try (BufferedReader reader = Files.newBufferedReader(filePath, java.nio.charset.StandardCharsets.UTF_8)) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String trimmed = line.trim();
+                if (!trimmed.isEmpty() && !trimmed.startsWith("#") && isValidTableName(trimmed)) {
+                    tableList.add(trimmed);
+                }
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to read table list file: " + filePathStr, e);
+        }
+        
+        return tableList;
+    }
+    
+    /**
+     * 从数据库加载表清单（返回表名列表）
+     * @param dataSource 数据源
+     * @return 表名列表
+     */
+    private static List<String> loadTableListFromDatabase(HikariDataSource dataSource) {
+        List<String> tableList = new ArrayList<>();
+        String querySql = ConfigUtil.getString("table.query.sql");
+        
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(querySql)) {
+            while (rs.next()) {
+                String tableName = rs.getString(1);
+                if (tableName != null && !tableName.trim().isEmpty() && isValidTableName(tableName.trim())) {
+                    tableList.add(tableName.trim());
+                }
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to load table list from database", e);
+        }
+        
+        return tableList;
+    }
+    
+    
+    /**
+     * 转义SQL字符串值，防止SQL注入（静态方法，供其他方法使用）
+     * @param value 字符串值
+     * @return 转义后的字符串值
+     */
+    private static String escapeSqlString(String value) {
+        if (value == null) {
+            return "NULL";
+        }
+        // 转义单引号：' -> ''
+        return "'" + value.replace("'", "''") + "'";
+    }
+    
+    /**
+     * 从临时表加载未完成的任务到队列（使用LEFT JOIN查询）
+     * 逻辑：查询临时表中存在但结果表中不存在的表（即未完成的表）
+     * 注意：必须使用创建临时表的同一个连接，因为临时表是session级别的
+     * @param conn 数据库连接（必须与创建临时表的连接是同一个session）
+     * @param queue 任务队列
+     * @return 总任务数
+     */
+    private static int loadPendingTasksFromTempTable(Connection conn, BlockingQueue<String> queue) {
+        // 使用LEFT JOIN查询：临时表中存在但结果表中不存在的表
+        String sql = "SELECT a.table_name FROM " +
+                     "(SELECT DISTINCT table_name, exe_date FROM " + sanitizeTableName(TEMP_EXECUTION_STATUS_TABLE) + 
+                     " WHERE exe_date='" + CURRENT_EXE_DATE + "') a " +
+                     "LEFT JOIN (SELECT DISTINCT table_name, data_day FROM " + sanitizeTableName(TARGET_TABLE_NAME) + 
+                     " WHERE data_day='" + CURRENT_EXE_DATE + "') b " +
+                     "ON a.table_name = b.table_name AND a.exe_date = b.data_day " +
+                     "WHERE b.table_name IS NULL";
+        
+        int totalTasks = 0;
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            while (rs.next()) {
+                String tableName = rs.getString(1);
+                if (tableName != null && !tableName.trim().isEmpty() && isValidTableName(tableName.trim())) {
+                    try {
+                        queue.put("ANALYZE TABLE " + sanitizeTableName(tableName.trim()) + " COMPUTE STATISTICS;");
+                        totalTasks++;
+                    } catch (InterruptedException e) {
+                        logger.error("Interrupted while adding task to queue", e);
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Failed to load tasks", e);
+                    }
+                }
+            }
+        } catch (SQLException e) {
+            logger.error("Failed to load pending tasks from temporary execution status table", e);
+            throw new RuntimeException("Failed to load pending tasks from temporary execution status table", e);
+        }
+
+        // 添加终止标记（每个工作线程一个）
+        for (int i = 0; i < CONCURRENCY; i++) {
+            try {
+                queue.put(POISON_PILL);
+            } catch (InterruptedException e) {
+                logger.error("Failed to add termination signal", e);
+                Thread.currentThread().interrupt();
+            }
+        }
+        
+        return totalTasks;
+    }
+    
 }

@@ -6,12 +6,15 @@
 
 - ✅ **自动发现表**：从 `system.tables_v` 系统表自动查询需要统计的表，或从文件读取指定表清单
 - ✅ **多种表清单来源**：支持从数据库查询（SQL）或从文件读取（File）两种方式获取表清单
+- ✅ **临时表管理**：使用session级别的临时表存储待处理表清单，支持事务操作，自动清理
+- ✅ **增量处理**：自动识别已完成的表，只处理未完成的表，支持程序中断后自动恢复
 - ✅ **并发执行**：支持多线程并发执行 ANALYZE 命令，提高效率
-- ✅ **批量写入**：使用批量插入和事务管理，优化写入性能
+- ✅ **批量写入**：使用 Inceptor 的 BATCHINSERT 语法进行批量插入，优化写入性能
 - ✅ **分页加载**：使用 ROW_NUMBER() 窗口函数实现分页，避免一次性加载过多数据，支持大规模表统计（2万+表）
 - ✅ **异常处理**：完善的异常处理机制，单个表失败不影响整体流程
 - ✅ **失败表记录**：自动记录执行失败的表名和日期，方便后续重跑
 - ✅ **连接池管理**：使用 HikariCP 连接池，分离分析和写入连接池，支持连接超时配置
+- ✅ **专用连接管理**：临时表使用专用连接，确保session级别临时表在整个程序运行期间有效
 - ✅ **详细日志**：提供详细的执行日志，包括启动配置、任务进度、统计信息等，所有日志均为英文，避免乱码问题
 - ✅ **灵活统计级别**：支持表级别和分区级别两种统计模式，可通过配置灵活切换，默认分区级别统计
 - ✅ **SQL注入防护**：自动验证和清理表名，防止SQL注入攻击
@@ -129,7 +132,7 @@ bin\start.bat
 | 文件 | 说明 | 必需 |
 |------|------|------|
 | `config.properties` | 数据库连接和运行参数配置 | ✅ 是 |
-| `tables.txt` | 表清单文件（当 `table.source.mode=file` 时使用） | ⚠️ 条件必需 |
+| `tables.txt` | 表清单文件（当 `table.source.mode=file` 时使用，默认：conf/tables.txt） | ⚠️ 条件必需 |
 | `failed_tables.txt` | 失败表记录文件（自动生成） | ❌ 否 |
 
 **配置文件说明：**
@@ -493,7 +496,7 @@ Could not find artifact io.transwarp:inceptor-driver:jar:8.37.3
    bin/start.sh  # Linux/Mac
    # 或
    bin\start.bat  # Windows
-   ```
+```
 
 ## 快速开始
 
@@ -674,14 +677,15 @@ table.query.sql=SELECT CONCAT(database_name,'.',table_name) \
 #支持空行和注释行（以 # 开头的行）
 #文件位置：
 #  - 相对路径（如 tables.txt）：文件放在程序运行的当前工作目录下（通常与 conf/ 目录同级）
-#  - 相对路径（如 conf/tables.txt）：文件放在 conf/ 目录下
+#  - 相对路径（如 conf/tables.txt）：文件放在 conf/ 目录下（推荐）
 #  - 绝对路径（如 /opt/inceptor-stat-collector/tables.txt）：文件放在指定绝对路径
+#默认值：conf/tables.txt
 #示例：
 ## 这是一条注释
 #default.table1
 #default.table2
 #prod.user_table
-table.list.file=tables.txt
+table.list.file=conf/tables.txt
 
 #====================== 失败表记录配置 ======================
 #失败表记录文件路径（记录执行失败的表名和日期）
@@ -695,6 +699,8 @@ failed.tables.file=conf/failed_tables.txt
 ### 3. 运行程序
 
 #### 方式一：使用启动脚本（推荐）
+
+**启动程序：**
 
 **Windows:**
 ```bash
@@ -860,6 +866,201 @@ mvn exec:java
 | 配置项 | 说明 | 默认值 | 详细说明 |
 |--------|------|--------|----------|
 | `failed.tables.file` | 失败表记录文件路径 | `conf/failed_tables.txt` | **作用**：记录执行失败的表名和日期<br>**格式**：每行一条记录，格式为 `table_name,failed_date`（例如：`db.table,2025-12-16`）<br>**用途**：可以提取表名作为 `table.list.file` 的输入，通过 `table.source.mode=file` 模式重跑失败的表<br>**文件位置**：可以使用相对路径或绝对路径<br>**注意**：文件会自动创建，如果目录不存在会自动创建目录 |
+
+### 临时表配置
+
+程序使用session级别的临时表来管理待处理表清单，实现增量处理和自动恢复功能。
+
+**临时表特性：**
+- **表名格式**：`default.inceptor_execution_status_table_<uuid>`（每次启动生成新的UUID）
+- **表类型**：临时表（TEMPORARY TABLE），session级别
+- **存储格式**：ORC格式，事务表（transactional='true'）
+- **分桶配置**：按uuid字段分桶，共11个桶
+- **生命周期**：仅在创建它的session中可见，session关闭后自动删除
+
+**临时表结构：**
+```sql
+CREATE TEMPORARY TABLE default.inceptor_execution_status_table_<uuid>
+(
+    uuid STRING,
+    table_name STRING,
+    flag INT,
+    exe_date DATE
+) CLUSTERED BY (uuid) INTO 11 BUCKETS STORED AS ORC
+TBLPROPERTIES('transactional'='true')
+```
+
+**工作原理：**
+1. **创建临时表**：程序启动时创建临时表，使用专用连接确保session级别有效性
+2. **写入待处理表清单**：将所有待处理的表（从SQL或文件加载）写入临时表，flag=0
+3. **增量查询**：使用LEFT JOIN查询临时表中存在但结果表中不存在的表（未完成的表）
+4. **自动清理**：程序结束时关闭专用连接，临时表自动删除
+
+**LEFT JOIN查询逻辑：**
+```sql
+SELECT a.table_name FROM
+(SELECT DISTINCT table_name, exe_date FROM 临时表 WHERE exe_date='当天日期') a
+LEFT JOIN (SELECT DISTINCT table_name, data_day FROM 结果表 WHERE data_day='当天日期') b
+ON a.table_name = b.table_name AND a.exe_date = b.data_day
+WHERE b.table_name IS NULL
+```
+
+**优势：**
+- ✅ **自动增量处理**：每次启动自动识别已完成的表，只处理未完成的表
+- ✅ **支持中断恢复**：程序中断后重新启动，自动继续处理未完成的表
+- ✅ **无需手动维护**：临时表自动创建和删除，无需手动管理
+- ✅ **事务支持**：使用事务表，保证数据一致性
+- ✅ **性能优化**：使用分桶和ORC格式，查询性能好
+
+**注意事项：**
+- ⚠️ **专用连接**：临时表使用专用连接创建，在整个程序运行期间保持不释放
+- ⚠️ **Session级别**：临时表只在创建它的session中可见，必须使用同一个连接
+- ⚠️ **自动清理**：程序结束时临时表会自动删除，无需手动清理
+- ✅ **UUID唯一性**：每次启动生成新的UUID，避免表名冲突
+
+**未完成任务配置详细说明：**
+
+#### pending.tables.file（未完成任务文件）
+
+**工作原理：**
+- 程序注册了 JVM ShutdownHook，当程序收到停止信号时（如 Ctrl+C、kill 命令、系统关闭等）会自动触发
+- ShutdownHook 会从任务队列中提取所有未完成的 ANALYZE SQL 命令
+- 提取表名并保存到指定文件，格式与 `table.list.file` 相同
+- 文件会自动去重，避免重复表名
+- 如果没有未完成的任务，不会创建文件
+
+**自动读取功能：**
+- ✅ **自动恢复**：如果配置为 `table.source.mode=sql`，但存在未完成任务文件，程序会自动切换到文件模式并继续处理未完成的任务
+- ✅ **智能判断**：程序会检查未完成任务文件是否包含有效的表名（排除注释和空行）
+- ✅ **日志提示**：自动切换时会输出日志提示，告知用户正在使用未完成任务文件
+- ✅ **手动控制**：如果需要强制使用 SQL 模式，可以删除未完成任务文件或显式设置 `table.source.mode=file`
+
+**自动清空功能：**
+- ✅ **自动清理**：当所有未完成任务都完成后，程序会自动删除未完成任务文件，防止下次启动时重复处理
+- ✅ **完成判断**：只有在所有分析任务和写入任务都成功完成时，才会清空文件
+- ✅ **日志记录**：清空文件时会输出日志，告知用户文件已被清除
+- ✅ **安全机制**：如果程序异常退出或任务未完成，文件会保留，下次启动时继续处理
+
+**触发场景：**
+1. **用户主动停止**：按 Ctrl+C 停止程序
+2. **系统关闭**：系统重启或关闭时
+3. **进程终止**：使用 `kill` 命令终止进程（SIGTERM 信号）
+4. **异常退出**：程序异常退出时（如果 JVM 能正常执行 ShutdownHook）
+
+**文件格式：**
+```text
+# Pending tasks file
+# This file contains table names that were not completed when the program was stopped
+# Format: one table name per line (database.table format)
+# Generated at: 2025-12-16 14:30:25
+# Total pending tasks: 150
+
+db1.table1
+db1.table2
+db2.table3
+db2.table4
+```
+
+**使用场景：**
+
+**场景1：程序中断后自动继续运行（推荐）**
+```bash
+# 1. 程序运行中，按 Ctrl+C 停止或使用 stop.sh 脚本停止
+# 程序会自动保存未完成任务到 conf/pending_tables.txt
+
+# 2. 直接重新运行程序（无需修改配置）
+# 如果配置为 table.source.mode=sql，程序会自动检测到未完成任务文件
+# 并自动切换到文件模式，继续处理未完成的任务
+bin/start.sh
+
+# 程序启动时会输出日志：
+# Found pending tasks file: conf/pending_tables.txt (from previous interrupted run)
+# Auto-switching to file mode to continue processing pending tasks
+```
+
+**场景1（备选）：手动配置继续运行**
+```bash
+# 1. 程序运行中，按 Ctrl+C 停止
+# 程序会自动保存未完成任务到 conf/pending_tables.txt
+
+# 2. 查看未完成任务
+cat conf/pending_tables.txt
+
+# 3. 手动配置为使用文件模式，继续运行未完成的表
+# 修改 conf/config.properties：
+# table.source.mode=file
+# table.list.file=conf/pending_tables.txt
+
+# 4. 重新运行程序
+bin/start.sh
+```
+
+**场景2：长时间运行的程序**
+- 程序需要处理大量表（如 2 万+表），可能需要运行数小时或数天
+- 如果中途需要停止（如系统维护、资源调整等），可以使用此功能保存进度
+- 下次启动时，可以只处理未完成的表，避免重复处理
+
+**场景3：分批处理**
+- 将大任务分成多个批次
+- 每批处理完后，查看 `pending_tables.txt` 确认是否有遗漏
+- 如果有遗漏，可以继续处理
+
+**自动清空功能：**
+- ✅ **自动清理**：当所有未完成任务都完成后，程序会自动删除未完成任务文件，防止下次启动时重复处理
+- ✅ **完成判断**：只有在所有分析任务和写入任务都成功完成时，才会清空文件
+- ✅ **日志记录**：清空文件时会输出日志：`Pending tasks file cleared: conf/pending_tables.txt (all tasks completed)`
+- ✅ **安全机制**：如果程序异常退出或任务未完成，文件会保留，下次启动时继续处理
+- ✅ **手动清空**：如果需要手动清空，可以直接删除文件：`rm conf/pending_tables.txt`（Linux/Mac）或 `del conf\pending_tables.txt`（Windows）
+
+**注意事项：**
+- ⚠️ **重要**：ShutdownHook 只在正常停止时触发，如果使用 `kill -9`（SIGKILL）强制终止，ShutdownHook 不会执行
+- ⚠️ **重要**：如果程序异常崩溃（如 OutOfMemoryError），ShutdownHook 可能不会执行
+- ✅ **建议**：使用 `kill` 命令（默认 SIGTERM）而不是 `kill -9`，以便程序能正常保存未完成任务
+- ✅ **建议**：定期检查 `pending_tables.txt` 文件，确认是否有未完成的任务
+- ✅ **建议**：如果 `pending_tables.txt` 文件存在，说明上次运行有未完成的任务，可以继续处理
+- ✅ **建议**：如果所有任务都已完成，文件会被自动清空，下次启动时会自动使用 SQL 模式
+
+**配置示例：**
+
+**示例1：使用默认路径（推荐）**
+```properties
+pending.tables.file=conf/pending_tables.txt
+```
+- 文件保存在 `conf/` 目录下，与配置文件一起管理
+- 便于查找和管理
+
+**示例2：使用绝对路径**
+```properties
+pending.tables.file=/opt/inceptor-stat-collector/pending_tables.txt
+```
+- 文件保存在指定绝对路径
+- 适合生产环境，便于统一管理
+
+**示例3：按环境区分**
+```properties
+# 生产环境
+pending.tables.file=/opt/inceptor-stat-collector/pending_tables_prod.txt
+
+# 测试环境
+pending.tables.file=/opt/inceptor-stat-collector/pending_tables_test.txt
+```
+- 不同环境使用不同的文件
+- 避免环境间混淆
+
+**常见问题：**
+
+**问题1：程序停止后没有生成 pending_tables.txt 文件**
+- **可能原因1**：所有任务都已完成，队列为空
+- **可能原因2**：使用了 `kill -9` 强制终止，ShutdownHook 未执行
+- **解决**：检查日志，确认是否有未完成的任务；使用 `kill` 命令而不是 `kill -9`
+
+**问题2：pending_tables.txt 文件包含已完成的表**
+- **可能原因**：表已完成但队列中仍有记录（如工作线程正在处理）
+- **解决**：这是正常现象，程序会跳过已完成的表（如果目标表中已有数据）
+
+**问题3：如何确认哪些表已完成**
+- **解决**：查询目标表，检查哪些表已有统计数据
+- 可以使用 SQL 查询：`SELECT DISTINCT table_name FROM target_table WHERE data_day = CURRENT_DATE`
 
 | 配置项 | 说明 | 默认值 | 详细说明 |
 |--------|------|--------|----------|
@@ -1302,7 +1503,7 @@ WHERE table_format NOT IN ('hbase','hyperdrive')
 
 | 配置项 | 说明 | 默认值 | 详细说明 |
 |--------|------|--------|----------|
-| `table.list.file` | 表清单文件路径 | `tables.txt` | **作用**：指定包含表清单的文件路径<br>**格式**：每行一个表名，格式为 `database.table`<br>**支持**：空行和注释（以 `#` 开头的行）<br>**注意**：仅在 `table.source.mode=file` 时生效 |
+| `table.list.file` | 表清单文件路径 | `conf/tables.txt` | **作用**：指定包含表清单的文件路径<br>**格式**：每行一个表名，格式为 `database.table`<br>**支持**：空行和注释（以 `#` 开头的行）<br>**注意**：仅在 `table.source.mode=file` 时生效<br>**默认值**：`conf/tables.txt`（推荐放在conf目录下） |
 
 **表清单文件配置详细说明：**
 
@@ -1458,28 +1659,44 @@ table.list.file=/opt/inceptor-stat-collector/tables-test.txt
 ### 执行流程
 
 ```
-1. 根据 table.source.mode 配置选择表清单来源
-   - sql 模式：从 system.tables_v 分页查询表列表
-   - file 模式：从 table.list.file 文件读取表列表
+1. 创建临时执行状态表（session级别，事务表）
+   - 表名格式：default.inceptor_execution_status_table_<uuid>
+   - 使用专用连接创建，确保session级别临时表在整个程序运行期间有效
+   - 表结构：uuid STRING, table_name STRING, flag INT, exe_date DATE
    ↓
-2. 生成 ANALYZE TABLE 命令并加入任务队列
+2. 根据 table.source.mode 配置选择表清单来源并加载
+   - sql 模式：从 system.tables_v 分页查询表列表（使用 table.query.sql）
+   - file 模式：从 table.list.file 文件读取表列表（默认：conf/tables.txt）
+   ↓
+3. 将待处理表清单写入临时表
+   - 使用 BATCHINSERT 语法批量插入
+   - 所有表的 flag 初始化为 0（pending状态）
+   - 使用专用连接，确保临时表可见
+   ↓
+4. 使用 LEFT JOIN 查询未完成的表
+   - SQL：临时表中存在但结果表中不存在的表（即未完成的表）
+   - 自动跳过已完成的表，实现增量处理
+   - 支持程序中断后自动恢复，只处理未完成的表
+   ↓
+5. 生成 ANALYZE TABLE 命令并加入任务队列
    - 验证表名格式，防止SQL注入
    - 如果队列满，会等待工作线程处理
    ↓
-3. 多个工作线程并发执行 ANALYZE 命令
+6. 多个工作线程并发执行 ANALYZE 命令
    - 执行失败的表会自动记录到 failed.tables.file
    - 单个表失败不影响其他表的处理
    ↓
-4. 解析 ANALYZE 返回的统计信息
+7. 解析 ANALYZE 返回的统计信息
    ↓
-5. 根据 analyze.level 配置过滤结果
+8. 根据 analyze.level 配置过滤结果
    - partition 模式：保留所有结果（表级别 + 分区级别）
    - table 模式：只保留表级别结果，过滤分区级别结果
    ↓
-6. 批量写入目标表（批量大小可配置）
+9. 批量写入目标表（使用 BATCHINSERT 语法，批量大小可配置）
    ↓
-7. 完成所有表的统计
-   - 输出统计信息：总任务数、成功数、失败数等
+10. 完成所有表的统计
+    - 输出统计信息：总任务数、成功数、失败数等
+    - 程序结束时关闭专用连接，临时表自动删除
 ```
 
 ### 统计级别处理机制
@@ -1845,6 +2062,34 @@ grep "Task loading completed" logs/inceptor-stat-collector.log
 本项目仅供内部使用。
 
 ## 更新日志
+
+### v1.7
+- ✅ 使用临时表替代永久执行状态表，实现增量处理和自动恢复
+- ✅ 临时表使用session级别，支持事务操作，自动清理
+- ✅ 使用LEFT JOIN查询未完成的表，自动跳过已完成的表
+- ✅ 使用专用连接管理临时表，确保session级别有效性
+- ✅ 改进批量插入性能，使用Inceptor的BATCHINSERT语法
+- ✅ 移除旧的执行状态表相关配置和逻辑
+- ✅ 优化执行流程，支持程序中断后自动恢复
+- ✅ 更新文档，添加临时表和增量处理的详细说明
+
+### v1.6
+- ✅ 改进执行状态表管理，支持自动识别已完成的表
+- ✅ 使用SQL比较执行状态表和结果表，自动更新flag
+- ✅ 优化启动逻辑，自动初始化执行状态表
+- ✅ 支持增量处理，避免重复处理已完成的表
+
+### v1.5
+- ✅ 添加未完成任务保存功能（`pending.tables.file`）
+- ✅ 程序停止时（Ctrl+C、kill等）自动保存队列中未完成的任务到文件
+- ✅ 支持优雅关闭，通过 JVM ShutdownHook 捕获停止信号
+- ✅ 未完成任务文件格式与 `table.list.file` 相同，可直接用于继续运行
+- ✅ 自动去重，避免重复表名
+- ✅ 如果没有未完成的任务，不创建文件
+- ✅ **自动恢复功能**：下次启动时自动检测并读取未完成任务文件，无需手动配置
+- ✅ **智能切换**：SQL模式下如果存在未完成任务文件，自动切换到文件模式继续处理
+- ✅ 添加 `stop.sh` 和 `stop.bat` 停止脚本，支持优雅停止程序
+- ✅ 更新文档，添加未完成任务配置的详细说明和使用场景
 
 ### v1.4
 - ✅ 添加表清单文件读取功能（`table.source.mode=file`）
